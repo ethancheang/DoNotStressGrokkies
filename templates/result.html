@@ -11,11 +11,11 @@
   {% endif %}
 </section>
 
-{% if tips.items %}
+{% if tips['items'] %}
 <section class="card tips">
   <h2>{{ tips.heading }}</h2>
   <ul>
-    {% for item in tips.items %}
+    {% for item in tips['items'] %}
       <li>{{ item.text }}</li>
     {% endfor %}
   </ul>
