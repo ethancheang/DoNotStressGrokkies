@@ -1,4 +1,4 @@
-"""Unit tests for logic_manager Gemini-fallback soft outcomes."""
+"""Unit tests for logic_manager post-AI finalizer (Gemini required)."""
 
 from __future__ import annotations
 
@@ -9,26 +9,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import io_manager
 import logic_manager as lm
 
-
-OUTCOME_KEYS = {
-    "soft_label",
-    "tips",
-    "speak_prominence",
-    "risk_score",
-    "risk_category",
-    "reasoning",
-    "source",
-}
 
 HIGH_LABEL = "Please reach out"
 MED_LABEL = "Worth a check-in"
 OK_LABEL = "You're doing ok"
 
 
-def _base(**overrides):
-    """Healthy-ish numeric record; old CLI fields are omitted on purpose."""
+def _student(**overrides):
+    """Student numeric fields only — not enough for Logic to run."""
     record = {
         "student_id": "2605581",
         "sleep_hours": 8.0,
@@ -42,28 +33,64 @@ def _base(**overrides):
     return record
 
 
-def _assert_valid_outcome(result: dict) -> None:
-    assert set(result.keys()) == OUTCOME_KEYS
+def _ai_fields(**overrides):
+    fields = {
+        "risk_score": 0.22,
+        "risk_category": "Low",
+        "primary_stressors": ["high_stress"],
+        "recommended_support": "Keep current routines.",
+        "confidence": 0.80,
+        "reasoning": "Signals look steady overall.",
+        "soft_label": OK_LABEL,
+        "tips": ["sleep_routine", "short_breaks"],
+        "speak_prominence": "low",
+    }
+    fields.update(overrides)
+    return fields
+
+
+def _enriched(**overrides):
+    """AI-enriched record: student inputs + successful Gemini fields."""
+    record = _student()
+    record.update(_ai_fields())
+    record.update(overrides)
+    return record
+
+
+def _assert_error_no_invented_outcome(result: dict, original: dict | None = None) -> None:
+    assert result["ok"] is False
+    assert result["error"] == "ai_fields_required"
+    assert "missing" in result
+    assert "invalid" in result
+    message = result["message"].lower()
+    assert "does not invent" in message or "ai-enriched" in message
+    if original is None or "soft_label" not in original:
+        assert "soft_label" not in result
+    if original is None or "source" not in original:
+        assert result.get("source") != "ai_logic"
+    assert result.get("source") != "logic_fallback"
+
+
+def _assert_success(result: dict) -> None:
+    assert result["ok"] is True
+    assert result["error"] is None
+    assert result["source"] == "ai_logic"
+    assert result["ai_ok"] is True
     assert result["soft_label"] in lm.SOFT_LABELS
     assert result["speak_prominence"] in lm.SPEAK_PROMINENCE
     assert result["risk_category"] in lm.RISK_CATEGORIES
-    assert result["source"] == "logic_fallback"
-    assert isinstance(result["reasoning"], str) and result["reasoning"].strip()
     assert isinstance(result["tips"], list)
-    assert 2 <= len(result["tips"]) <= 4
-    assert len(result["tips"]) == len(set(result["tips"]))
     assert all(tip in lm.TIPS_ALLOWLIST for tip in result["tips"])
-    # IDs, not resolved copy — format_tips looks up TIPS_ALLOWLIST[id]
-    assert all(tip != lm.TIPS_ALLOWLIST[tip] for tip in result["tips"])
-    assert isinstance(result["risk_score"], float)
+    assert len(result["tips"]) == len(set(result["tips"]))
     assert 0.0 <= result["risk_score"] <= 1.0
-
-
-def _assert_band(result: dict, label: str, prominence: str, category: str) -> None:
-    _assert_valid_outcome(result)
-    assert result["soft_label"] == label
-    assert result["speak_prominence"] == prominence
-    assert result["risk_category"] == category
+    assert 0.0 <= result["confidence"] <= 1.0
+    assert isinstance(result["reasoning"], str) and result["reasoning"].strip()
+    assert result["logic_rule"] in {
+        "ai_clamped",
+        "reach_out_high_ai_stress_low_support",
+        "check_in_high_category_financial",
+        "check_in_sleep_deprivation",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -83,366 +110,373 @@ def test_module_does_not_reference_removed_fields():
     assert "submission_rate" not in source
     assert "assign_intervention_tier" not in source
     assert "intervention_tier" not in source
+    assert "assign_soft_outcome" not in source
+    assert "apply_soft_outcome" not in source
+    assert 'LOGIC_SOURCE = "logic_fallback"' not in source
 
 
-def test_old_tier_api_removed():
+def test_old_fallback_api_removed():
+    assert not hasattr(lm, "assign_soft_outcome")
+    assert not hasattr(lm, "apply_soft_outcome")
     assert not hasattr(lm, "assign_intervention_tier")
     assert not hasattr(lm, "apply_intervention_tier")
-    assert hasattr(lm, "assign_soft_outcome")
-    assert hasattr(lm, "apply_soft_outcome")
+    assert hasattr(lm, "apply_logic")
+    assert hasattr(lm, "finalize_outcome")
+    assert lm.LOGIC_SOURCE == "ai_logic"
 
 
-def test_allow_list_constants_exported():
+def test_allow_lists_match_io_and_ai():
+    assert lm.SOFT_LABELS == io_manager.SOFT_LABELS
+    assert lm.SPEAK_PROMINENCE == io_manager.SPEAK_PROMINENCE
+    assert set(lm.TIPS_ALLOWLIST) == set(io_manager.TIPS_ALLOWLIST)
+    assert lm.TIPS_ALLOWLIST == io_manager.TIPS_ALLOWLIST
     assert lm.SOFT_LABELS == (
         "You're doing ok",
         "Worth a check-in",
         "Please reach out",
     )
     assert lm.SPEAK_PROMINENCE == ("low", "medium", "high")
-    assert lm.TIPS_ALLOWLIST == {
-        "sleep_routine": (
-            "Try to keep a regular sleep schedule, including on weekends."
-        ),
-        "rest_a_little_more": (
-            "If you can, give yourself a bit more rest — even 30 extra minutes "
-            "can help."
-        ),
-        "short_breaks": (
-            "Take short, planned breaks between study blocks instead of pushing "
-            "through without a pause."
-        ),
-        "workload_chunks": (
-            "Break larger assignments into smaller tasks and spread them across "
-            "the week."
-        ),
-        "money_worries": (
-            "If money is on your mind, campus support can help you find the "
-            "right next step."
-        ),
-        "talk_to_someone": (
-            "Reach out to a friend, classmate, or family member — you do not "
-            "have to handle this alone."
-        ),
-        "keep_social_contact": (
-            "Stay in touch with people who help you feel supported, even with "
-            "a short check-in."
-        ),
-        "feelings_check_in": (
-            "Name how you have been feeling and give yourself permission to "
-            "ask for help if school feels heavy."
-        ),
-    }
-    assert not hasattr(lm, "ALLOWED_TIPS")
+    assert lm.REQUIRED_AI_FIELDS == (
+        "risk_score",
+        "risk_category",
+        "primary_stressors",
+        "soft_label",
+        "tips",
+        "speak_prominence",
+        "reasoning",
+        "confidence",
+    )
 
 
 # ---------------------------------------------------------------------------
-# High band — Please reach out
+# Reject records without AI fields — no invented soft outcomes
 # ---------------------------------------------------------------------------
 
-def test_high_stress_and_very_low_sleep():
-    result = lm.assign_soft_outcome(_base(stress_level=8, sleep_hours=5.0))
-    _assert_band(result, HIGH_LABEL, "high", "High")
-    assert "high stress" in result["reasoning"].lower() or "sleep" in result["reasoning"].lower()
-    assert "sleep_routine" in result["tips"]
-    assert "feelings_check_in" in result["tips"]
+def test_student_only_record_is_rejected():
+    record = _student(stress_level=10, sleep_hours=3.0, social_support=1)
+    result = lm.apply_logic(record)
+    _assert_error_no_invented_outcome(result, record)
+    assert set(lm.REQUIRED_AI_FIELDS).issubset(set(result["missing"]))
+    assert "soft_label" not in result
+    assert "tips" not in result
+    assert "speak_prominence" not in result
 
 
-def test_high_stress_workload_and_very_low_support():
-    result = lm.assign_soft_outcome(
-        _base(stress_level=9, academic_workload=8, social_support=3, sleep_hours=8.0)
+def test_empty_and_non_dict_rejected():
+    empty = lm.apply_logic({})
+    _assert_error_no_invented_outcome(empty, {})
+    assert empty["missing"] == list(lm.REQUIRED_AI_FIELDS)
+
+    not_dict = lm.apply_logic("not a record")  # type: ignore[arg-type]
+    _assert_error_no_invented_outcome(not_dict)
+    assert "record" in not_dict["invalid"]
+
+
+@pytest.mark.parametrize("field", list(lm.REQUIRED_AI_FIELDS))
+def test_each_missing_ai_field_is_rejected(field):
+    record = _enriched()
+    del record[field]
+    result = lm.apply_logic(record)
+    _assert_error_no_invented_outcome(result, record)
+    assert field in result["missing"]
+    if field == "soft_label":
+        assert "soft_label" not in result
+
+
+def test_unusable_ai_types_are_rejected():
+    bad_score = _enriched(risk_score="hot")
+    result = lm.apply_logic(bad_score)
+    _assert_error_no_invented_outcome(result, bad_score)
+    assert result["ok"] is False
+    assert "risk_score" in result["invalid"]
+
+    bad_tips = _enriched(tips="sleep_routine")
+    result = lm.apply_logic(bad_tips)
+    _assert_error_no_invented_outcome(result, bad_tips)
+    assert "tips" in result["invalid"]
+
+    bad_reasoning = _enriched(reasoning="")
+    result = lm.apply_logic(bad_reasoning)
+    _assert_error_no_invented_outcome(result, bad_reasoning)
+    assert "reasoning" in result["invalid"]
+
+    bad_stressors = _enriched(primary_stressors="sleep_deprivation")
+    result = lm.apply_logic(bad_stressors)
+    _assert_error_no_invented_outcome(result, bad_stressors)
+    assert "primary_stressors" in result["invalid"]
+
+
+def test_old_absence_fields_do_not_invent_an_outcome():
+    record = _student(
+        consecutive_absences=99,
+        submission_rate=0.0,
+        cca_count=20,
     )
-    _assert_band(result, HIGH_LABEL, "high", "High")
-    assert "workload_chunks" in result["tips"]
-    assert "talk_to_someone" in result["tips"]
-
-
-def test_high_financial_stress_and_low_support():
-    result = lm.assign_soft_outcome(
-        _base(financial_stress=8, stress_level=7, social_support=4, sleep_hours=8.0)
-    )
-    _assert_band(result, HIGH_LABEL, "high", "High")
-    assert "money_worries" in result["tips"]
-    assert "talk_to_someone" in result["tips"]
-
-
-# ---------------------------------------------------------------------------
-# Medium band — Worth a check-in
-# ---------------------------------------------------------------------------
-
-def test_medium_elevated_stress_and_low_sleep():
-    result = lm.assign_soft_outcome(_base(stress_level=6, sleep_hours=5.5))
-    _assert_band(result, MED_LABEL, "medium", "Moderate")
-    assert "sleep_routine" in result["tips"]
-    assert "feelings_check_in" in result["tips"]
-
-
-def test_medium_elevated_stress_and_high_workload():
-    result = lm.assign_soft_outcome(
-        _base(stress_level=6, academic_workload=7, sleep_hours=8.0)
-    )
-    _assert_band(result, MED_LABEL, "medium", "Moderate")
-    assert "short_breaks" in result["tips"]
-
-
-def test_medium_financial_and_low_support():
-    result = lm.assign_soft_outcome(
-        _base(financial_stress=7, social_support=5, stress_level=3, sleep_hours=8.0)
-    )
-    _assert_band(result, MED_LABEL, "medium", "Moderate")
-    assert "money_worries" in result["tips"]
-    assert "talk_to_someone" in result["tips"]
-
-
-def test_medium_high_workload_and_short_sleep():
-    result = lm.assign_soft_outcome(
-        _base(academic_workload=8, sleep_hours=6.0, stress_level=3)
-    )
-    _assert_band(result, MED_LABEL, "medium", "Moderate")
-    assert "sleep_routine" in result["tips"]
-    assert "workload_chunks" in result["tips"]
-
-
-# ---------------------------------------------------------------------------
-# Low band — default
-# ---------------------------------------------------------------------------
-
-def test_default_doing_ok():
-    result = lm.assign_soft_outcome(_base())
-    _assert_band(result, OK_LABEL, "low", "Low")
-    assert "no high-severity" in result["reasoning"].lower() or "doing ok" in result["reasoning"].lower()
-
-
-def test_missing_numeric_fields_default_to_ok():
-    result = lm.assign_soft_outcome({"student_id": "2400001"})
-    _assert_band(result, OK_LABEL, "low", "Low")
+    result = lm.apply_logic(record)
+    _assert_error_no_invented_outcome(result, record)
+    assert result.get("soft_label") not in lm.SOFT_LABELS
 
 
 # ---------------------------------------------------------------------------
-# Priority: highest severity wins
+# Happy path — clamp only, no escalation
 # ---------------------------------------------------------------------------
 
-def test_high_beats_medium_when_both_match():
-    result = lm.assign_soft_outcome(
-        _base(
-            stress_level=9,
-            sleep_hours=4.0,
-            academic_workload=8,
-            financial_stress=8,
-            social_support=4,
-        )
-    )
-    _assert_band(result, HIGH_LABEL, "high", "High")
-
-
-def test_first_high_rule_wins_over_later_high_rules():
-    result = lm.assign_soft_outcome(
-        _base(
-            stress_level=8,
-            sleep_hours=4.5,
-            academic_workload=9,
-            social_support=2,
-            financial_stress=9,
-        )
-    )
-    _assert_band(result, HIGH_LABEL, "high", "High")
-    assert "sleep" in result["reasoning"].lower()
-
-
-# ---------------------------------------------------------------------------
-# Boundaries (inclusive / exclusive as documented)
-# ---------------------------------------------------------------------------
-
-def test_high_sleep_boundary_inclusive_at_5():
-    at_threshold = lm.assign_soft_outcome(_base(stress_level=8, sleep_hours=5.0))
-    just_above = lm.assign_soft_outcome(_base(stress_level=8, sleep_hours=5.5))
-    _assert_band(at_threshold, HIGH_LABEL, "high", "High")
-    _assert_band(just_above, MED_LABEL, "medium", "Moderate")
-
-
-def test_high_stress_boundary_requires_8():
-    at_eight = lm.assign_soft_outcome(_base(stress_level=8, sleep_hours=5.0))
-    at_seven = lm.assign_soft_outcome(_base(stress_level=7, sleep_hours=5.0))
-    _assert_band(at_eight, HIGH_LABEL, "high", "High")
-    _assert_band(at_seven, MED_LABEL, "medium", "Moderate")
-
-
-def test_high_support_boundary_for_workload_rule():
-    support_3 = lm.assign_soft_outcome(
-        _base(stress_level=8, academic_workload=8, social_support=3, sleep_hours=8.0)
-    )
-    support_4 = lm.assign_soft_outcome(
-        _base(stress_level=8, academic_workload=8, social_support=4, sleep_hours=8.0)
-    )
-    _assert_band(support_3, HIGH_LABEL, "high", "High")
-    _assert_band(support_4, MED_LABEL, "medium", "Moderate")
-
-
-def test_high_financial_rule_stress_boundary():
-    stress_7 = lm.assign_soft_outcome(
-        _base(financial_stress=8, stress_level=7, social_support=4, sleep_hours=8.0)
-    )
-    stress_6 = lm.assign_soft_outcome(
-        _base(financial_stress=8, stress_level=6, social_support=4, sleep_hours=8.0)
-    )
-    _assert_band(stress_7, HIGH_LABEL, "high", "High")
-    _assert_band(stress_6, MED_LABEL, "medium", "Moderate")
-
-
-def test_medium_sleep_boundary_strict_less_than_6():
-    just_under = lm.assign_soft_outcome(_base(stress_level=6, sleep_hours=5.5, academic_workload=4))
-    at_six = lm.assign_soft_outcome(_base(stress_level=6, sleep_hours=6.0, academic_workload=4))
-    _assert_band(just_under, MED_LABEL, "medium", "Moderate")
-    _assert_band(at_six, OK_LABEL, "low", "Low")
-
-
-def test_medium_workload_boundary_inclusive_at_7():
-    at_seven = lm.assign_soft_outcome(
-        _base(stress_level=6, academic_workload=7, sleep_hours=8.0)
-    )
-    at_six = lm.assign_soft_outcome(
-        _base(stress_level=6, academic_workload=6, sleep_hours=8.0)
-    )
-    _assert_band(at_seven, MED_LABEL, "medium", "Moderate")
-    _assert_band(at_six, OK_LABEL, "low", "Low")
-
-
-def test_medium_financial_support_boundaries():
-    fires = lm.assign_soft_outcome(
-        _base(financial_stress=7, social_support=5, stress_level=3, sleep_hours=8.0)
-    )
-    support_too_high = lm.assign_soft_outcome(
-        _base(financial_stress=7, social_support=6, stress_level=3, sleep_hours=8.0)
-    )
-    financial_too_low = lm.assign_soft_outcome(
-        _base(financial_stress=6, social_support=5, stress_level=3, sleep_hours=8.0)
-    )
-    _assert_band(fires, MED_LABEL, "medium", "Moderate")
-    _assert_band(support_too_high, OK_LABEL, "low", "Low")
-    _assert_band(financial_too_low, OK_LABEL, "low", "Low")
-
-
-def test_medium_workload_sleep_boundary_strict_less_than_6_5():
-    just_under = lm.assign_soft_outcome(
-        _base(academic_workload=8, sleep_hours=6.0, stress_level=3)
-    )
-    at_threshold = lm.assign_soft_outcome(
-        _base(academic_workload=8, sleep_hours=6.5, stress_level=3)
-    )
-    _assert_band(just_under, MED_LABEL, "medium", "Moderate")
-    _assert_band(at_threshold, OK_LABEL, "low", "Low")
-
-
-# ---------------------------------------------------------------------------
-# Ignored fields: absences, submission_rate, feelings_text, student_id
-# ---------------------------------------------------------------------------
-
-def test_old_fields_do_not_change_outcome():
-    clean = lm.assign_soft_outcome(_base())
-    noisy = lm.assign_soft_outcome(
-        _base(
-            consecutive_absences=99,
-            submission_rate=0.0,
-            assignment_submission_rate=0.0,
-            cca=20,
-            number_of_ccas=20,
-            cca_count=20,
-        )
-    )
-    assert clean == noisy
-
-
-def test_feelings_text_is_not_used_in_rules():
-    calm_numbers = _base(feelings_text="")
-    alarming_text = _base(
-        feelings_text="I cannot cope, crisis, please escalate immediately."
-    )
-    assert lm.assign_soft_outcome(calm_numbers) == lm.assign_soft_outcome(alarming_text)
-
-
-def test_student_id_does_not_affect_rules():
-    a = lm.assign_soft_outcome(_base(student_id="2600001", stress_level=9, sleep_hours=3.0))
-    b = lm.assign_soft_outcome(_base(student_id="2309999", stress_level=9, sleep_hours=3.0))
-    assert a == b
-    assert "2600001" not in a["reasoning"]
-    assert "2309999" not in b["reasoning"]
-
-
-# ---------------------------------------------------------------------------
-# apply_soft_outcome merge / immutability
-# ---------------------------------------------------------------------------
-
-def test_apply_soft_outcome_merges_without_mutating_original():
-    record = _base(stress_level=8, sleep_hours=4.5)
+def test_healthy_ai_record_passes_through_clamped():
+    record = _enriched()
     snapshot = dict(record)
-    enriched = lm.apply_soft_outcome(record)
-
+    result = lm.apply_logic(record)
+    _assert_success(result)
     assert record == snapshot
-    assert enriched is not record
-    assert "soft_label" not in record
-    assert "tips" not in record
+    assert result is not record
+    assert result["soft_label"] == OK_LABEL
+    assert result["speak_prominence"] == "low"
+    assert result["risk_category"] == "Low"
+    assert result["tips"] == ["sleep_routine", "short_breaks"]
+    assert result["student_id"] == "2605581"
+    assert result["logic_rule"] == "ai_clamped"
+    assert result["source"] == "ai_logic"
 
-    assert enriched["student_id"] == "2605581"
-    assert enriched["sleep_hours"] == 4.5
-    assert enriched["soft_label"] == HIGH_LABEL
-    assert enriched["source"] == "logic_fallback"
-    _assert_valid_outcome({k: enriched[k] for k in OUTCOME_KEYS})
 
-
-def test_apply_soft_outcome_preserves_feelings_text_pass_through():
-    record = _base(feelings_text="exam week is a lot")
-    enriched = lm.apply_soft_outcome(record)
-    assert enriched["feelings_text"] == "exam week is a lot"
-    assert record["feelings_text"] == "exam week is a lot"
+def test_finalize_outcome_matches_apply_logic():
+    record = _enriched(risk_score=0.4, risk_category="Moderate", soft_label=MED_LABEL)
+    assert lm.finalize_outcome(record) == lm.apply_logic(record)
 
 
 # ---------------------------------------------------------------------------
-# risk_score formula + allow-list sweep
+# Multi-condition rules that reference AI fields
 # ---------------------------------------------------------------------------
 
-def test_risk_score_matches_documented_formula_for_healthy_record():
-    # sleep 8 → 0; stress 3 → 2/9; workload 4 → 3/9; financial 2 → 1/9; support 8 → 2/9
-    expected = round(
-        0.30 * (2 / 9)
-        + 0.20 * 0.0
-        + 0.20 * (3 / 9)
-        + 0.15 * (1 / 9)
-        + 0.15 * (2 / 9),
-        4,
+def test_reach_out_rule_fires_on_high_ai_score_stress_and_low_support():
+    result = lm.apply_logic(
+        _enriched(
+            risk_score=0.76,
+            risk_category="Moderate",
+            soft_label=MED_LABEL,
+            speak_prominence="medium",
+            stress_level=8,
+            social_support=3,
+            tips=["short_breaks"],
+        )
     )
-    result = lm.assign_soft_outcome(_base())
-    assert result["risk_score"] == pytest.approx(expected)
+    _assert_success(result)
+    assert result["soft_label"] == HIGH_LABEL
+    assert result["speak_prominence"] == "high"
+    assert result["risk_category"] == "High"
+    assert result["logic_rule"] == "reach_out_high_ai_stress_low_support"
+    assert "reach_out_high_ai_stress_low_support" in result["logic_rules"]
+    assert "talk_to_someone" in result["tips"]
+    assert "feelings_check_in" in result["tips"]
+    assert "Logic adjusted" in result["reasoning"]
 
 
-def test_risk_score_increases_when_stress_and_sleep_worsen():
-    healthy = lm.assign_soft_outcome(_base())
-    worse = lm.assign_soft_outcome(_base(stress_level=9, sleep_hours=3.0))
-    assert worse["risk_score"] > healthy["risk_score"]
+def test_reach_out_rule_boundaries():
+    base = dict(
+        risk_score=0.76,
+        risk_category="Moderate",
+        soft_label=MED_LABEL,
+        speak_prominence="medium",
+        stress_level=8,
+        social_support=3,
+    )
+    fires = lm.apply_logic(_enriched(**base))
+    assert fires["soft_label"] == HIGH_LABEL
+
+    score_eq = lm.apply_logic(_enriched(**{**base, "risk_score": 0.75}))
+    assert score_eq["soft_label"] == MED_LABEL
+    assert "reach_out_high_ai_stress_low_support" not in score_eq["logic_rules"]
+
+    stress_7 = lm.apply_logic(_enriched(**{**base, "stress_level": 7}))
+    assert stress_7["soft_label"] == MED_LABEL
+
+    support_4 = lm.apply_logic(_enriched(**{**base, "social_support": 4}))
+    assert support_4["soft_label"] == MED_LABEL
 
 
-@pytest.mark.parametrize(
-    "record",
-    [
-        _base(),
-        _base(stress_level=8, sleep_hours=5.0),
-        _base(stress_level=8, academic_workload=8, social_support=3),
-        _base(financial_stress=8, stress_level=7, social_support=4),
-        _base(stress_level=6, sleep_hours=5.5),
-        _base(stress_level=6, academic_workload=7),
-        _base(financial_stress=7, social_support=5),
-        _base(academic_workload=8, sleep_hours=6.0, stress_level=3),
-        _base(sleep_hours=0.0, stress_level=1, academic_workload=1, financial_stress=1, social_support=10),
-        _base(sleep_hours=24.0, stress_level=10, academic_workload=10, financial_stress=10, social_support=1),
-    ],
-)
-def test_every_band_stays_inside_allow_lists(record):
-    result = lm.assign_soft_outcome(record)
-    _assert_valid_outcome(result)
-    if result["soft_label"] == HIGH_LABEL:
-        assert result["speak_prominence"] == "high"
-        assert result["risk_category"] == "High"
-    elif result["soft_label"] == MED_LABEL:
-        assert result["speak_prominence"] == "medium"
-        assert result["risk_category"] == "Moderate"
-    else:
-        assert result["speak_prominence"] == "low"
-        assert result["risk_category"] == "Low"
+def test_check_in_rule_fires_when_mild_label_conflicts_with_high_category():
+    result = lm.apply_logic(
+        _enriched(
+            soft_label=OK_LABEL,
+            risk_category="High",
+            risk_score=0.60,
+            speak_prominence="low",
+            financial_stress=8,
+            stress_level=4,
+            social_support=8,
+            tips=["short_breaks"],
+        )
+    )
+    _assert_success(result)
+    assert result["soft_label"] == MED_LABEL
+    assert result["speak_prominence"] == "medium"
+    assert result["risk_category"] == "High"
+    assert result["logic_rule"] == "check_in_high_category_financial"
+    assert "money_worries" in result["tips"]
+
+
+def test_check_in_financial_rule_boundaries():
+    base = dict(
+        soft_label=OK_LABEL,
+        risk_category="High",
+        risk_score=0.60,
+        speak_prominence="low",
+        financial_stress=8,
+        social_support=8,
+        stress_level=3,
+    )
+    fires = lm.apply_logic(_enriched(**base))
+    assert fires["soft_label"] == MED_LABEL
+
+    financial_7 = lm.apply_logic(_enriched(**{**base, "financial_stress": 7}))
+    assert financial_7["soft_label"] == OK_LABEL
+    assert financial_7["logic_rule"] == "ai_clamped"
+
+    moderate = lm.apply_logic(_enriched(**{**base, "risk_category": "Moderate"}))
+    assert moderate["soft_label"] == OK_LABEL
+
+
+def test_sleep_deprivation_rule_combines_ai_stressor_and_student_sleep():
+    result = lm.apply_logic(
+        _enriched(
+            soft_label=OK_LABEL,
+            risk_category="Low",
+            risk_score=0.30,
+            speak_prominence="low",
+            primary_stressors=["sleep_deprivation"],
+            sleep_hours=5.0,
+            stress_level=7,
+            social_support=8,
+            financial_stress=2,
+            tips=["short_breaks"],
+        )
+    )
+    _assert_success(result)
+    assert result["soft_label"] == MED_LABEL
+    assert result["speak_prominence"] == "medium"
+    assert result["risk_category"] == "Moderate"
+    assert result["logic_rule"] == "check_in_sleep_deprivation"
+    assert "sleep_routine" in result["tips"]
+
+
+def test_sleep_deprivation_rule_requires_ai_stressor():
+    no_stressor = lm.apply_logic(
+        _enriched(
+            soft_label=OK_LABEL,
+            primary_stressors=["high_stress"],
+            sleep_hours=4.0,
+            stress_level=9,
+            social_support=8,
+            risk_score=0.30,
+            risk_category="Low",
+        )
+    )
+    assert no_stressor["soft_label"] == OK_LABEL
+    assert no_stressor["logic_rule"] == "ai_clamped"
+
+
+def test_rules_never_de_escalate_a_higher_ai_label():
+    result = lm.apply_logic(
+        _enriched(
+            soft_label=HIGH_LABEL,
+            speak_prominence="high",
+            risk_category="High",
+            risk_score=0.90,
+            financial_stress=9,
+            stress_level=9,
+            social_support=2,
+            primary_stressors=["sleep_deprivation", "high_stress"],
+            sleep_hours=4.0,
+        )
+    )
+    _assert_success(result)
+    assert result["soft_label"] == HIGH_LABEL
+    assert result["speak_prominence"] == "high"
+    assert "reach_out_high_ai_stress_low_support" in result["logic_rules"]
+
+
+def test_missing_student_numerics_skip_rules_but_keep_clamped_ai():
+    record = _ai_fields()
+    result = lm.apply_logic(record)
+    _assert_success(result)
+    assert result["soft_label"] == OK_LABEL
+    assert result["logic_rule"] == "ai_clamped"
+
+
+# ---------------------------------------------------------------------------
+# Allow-list clamping
+# ---------------------------------------------------------------------------
+
+def test_curly_apostrophe_soft_label_is_normalised():
+    result = lm.apply_logic(_enriched(soft_label="You’re doing ok"))
+    _assert_success(result)
+    assert result["soft_label"] == OK_LABEL
+
+
+def test_unknown_soft_label_clamped_from_risk_category():
+    result = lm.apply_logic(
+        _enriched(soft_label="totally fine", risk_category="High", risk_score=0.5)
+    )
+    _assert_success(result)
+    assert result["soft_label"] == HIGH_LABEL
+    assert "soft_label" in result["logic_clamp_notes"]
+
+
+def test_unknown_tips_are_dropped():
+    result = lm.apply_logic(
+        _enriched(tips=["sleep_routine", "invented_tip", "short_breaks", "sleep_routine"])
+    )
+    _assert_success(result)
+    assert result["tips"] == ["sleep_routine", "short_breaks"]
+    assert "tips" in result["logic_clamp_notes"]
+    assert "invented_tip" not in result["tips"]
+
+
+def test_speak_prominence_case_and_unknown_clamped():
+    upper = lm.apply_logic(_enriched(speak_prominence="HIGH"))
+    _assert_success(upper)
+    assert upper["speak_prominence"] == "high"
+
+    unknown = lm.apply_logic(
+        _enriched(speak_prominence="urgent", risk_category="Moderate", risk_score=0.5)
+    )
+    _assert_success(unknown)
+    assert unknown["speak_prominence"] == "medium"
+    assert "speak_prominence" in unknown["logic_clamp_notes"]
+
+
+def test_risk_category_case_and_unknown_clamped_from_score():
+    cased = lm.apply_logic(_enriched(risk_category="high", risk_score=0.5, soft_label=MED_LABEL))
+    _assert_success(cased)
+    assert cased["risk_category"] == "High"
+
+    unknown = lm.apply_logic(
+        _enriched(risk_category="severe", risk_score=0.80, soft_label=MED_LABEL)
+    )
+    _assert_success(unknown)
+    assert unknown["risk_category"] == "High"
+    assert "risk_category" in unknown["logic_clamp_notes"]
+
+
+def test_unknown_primary_stressors_dropped():
+    result = lm.apply_logic(
+        _enriched(primary_stressors=["sleep_deprivation", "aliens", "high_stress"])
+    )
+    _assert_success(result)
+    assert result["primary_stressors"] == ["sleep_deprivation", "high_stress"]
+    assert "primary_stressors" in result["logic_clamp_notes"]
+
+
+def test_out_of_range_scores_are_clamped_not_rejected():
+    result = lm.apply_logic(_enriched(risk_score=1.4, confidence=-0.2))
+    _assert_success(result)
+    assert result["risk_score"] == 1.0
+    assert result["confidence"] == 0.0
+
+
+def test_feelings_text_is_pass_through_not_a_rule_input():
+    calm = lm.apply_logic(_enriched(feelings_text=""))
+    loud = lm.apply_logic(
+        _enriched(feelings_text="I cannot cope, crisis, please escalate immediately.")
+    )
+    assert calm["soft_label"] == loud["soft_label"]
+    assert calm["logic_rule"] == loud["logic_rule"] == "ai_clamped"
+    assert loud["feelings_text"].startswith("I cannot cope")
