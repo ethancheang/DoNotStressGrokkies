@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block title %}Check-in · DoNotStress{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h1>How are you doing?</h1>
+  <p class="lede">
+    This check-in is for you. Nothing is stored unless you choose to save it
+    on the next page.
+  </p>
+
+  <form method="post" action="{{ url_for('submit_checkin') }}" novalidate>
+    <div class="field {% if errors.get('student_id') %}has-error{% endif %}">
+      <label for="student_id">{{ form_prompts.student_id }}</label>
+      <input
+        id="student_id"
+        name="student_id"
+        type="text"
+        inputmode="numeric"
+        autocomplete="off"
+        maxlength="7"
+        placeholder="{{ student_id_example }}"
+        value="{{ values.student_id }}"
+        required
+      >
+      <p class="hint">7 digits: year 23–26 plus 5 digits (for example {{ student_id_example }}).</p>
+      {% if errors.get('student_id') %}
+        <p class="error">{{ errors.student_id }}</p>
+      {% endif %}
+    </div>
+
+    <div class="field {% if errors.get('sleep_hours') %}has-error{% endif %}">
+      <label for="sleep_hours">{{ form_prompts.sleep_hours }}</label>
+      <input
+        id="sleep_hours"
+        name="sleep_hours"
+        type="number"
+        min="{{ sleep_min }}"
+        max="{{ sleep_max }}"
+        step="{{ sleep_step }}"
+        placeholder="7.5"
+        value="{{ values.sleep_hours }}"
+        required
+      >
+      <p class="hint">Between {{ sleep_min }} and {{ sleep_max }} hours, in {{ sleep_step }}-hour steps.</p>
+      {% if errors.get('sleep_hours') %}
+        <p class="error">{{ errors.sleep_hours }}</p>
+      {% endif %}
+    </div>
+
+    {% for field in scale_fields %}
+      <fieldset class="field scale-field {% if errors.get(field) %}has-error{% endif %}">
+        <legend>{{ form_prompts[field] }}</legend>
+        <div class="scale" role="radiogroup" aria-label="{{ form_prompts[field] }}">
+          {% for n in range(scale_min, scale_max + 1) %}
+            <label class="scale-opt">
+              <input
+                type="radio"
+                name="{{ field }}"
+                value="{{ n }}"
+                {% if values[field] == n|string %}checked{% endif %}
+                required
+              >
+              <span>{{ n }}</span>
+            </label>
+          {% endfor %}
+        </div>
+        {% if errors.get(field) %}
+          <p class="error">{{ errors[field] }}</p>
+        {% endif %}
+      </fieldset>
+    {% endfor %}
+
+    <div class="field {% if errors.get('feelings_text') %}has-error{% endif %}">
+      <label for="feelings_text">{{ form_prompts.feelings_text }}</label>
+      <textarea
+        id="feelings_text"
+        name="feelings_text"
+        rows="4"
+        maxlength="2000"
+        placeholder="Optional — share as much or as little as you like."
+      >{{ values.feelings_text }}</textarea>
+      {% if errors.get('feelings_text') %}
+        <p class="error">{{ errors.feelings_text }}</p>
+      {% endif %}
+    </div>
+
+    <button type="submit" class="btn primary">See my check-in</button>
+  </form>
+</section>
+{% endblock %}

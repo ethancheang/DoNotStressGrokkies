@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Your check-in · DoNotStress{% endblock %}
+
+{% block content %}
+<section class="card outcome tone-{{ soft.tone or 'supportive' }}">
+  <p class="eyebrow">Your check-in</p>
+  <h1>{{ soft.heading or soft.label }}</h1>
+  {% if soft.body %}
+    <p class="lede">{{ soft.body }}</p>
+  {% endif %}
+</section>
+
+{% if tips.items %}
+<section class="card tips">
+  <h2>{{ tips.heading }}</h2>
+  <ul>
+    {% for item in tips.items %}
+      <li>{{ item.text }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<aside class="card advisor-panel prominence-{{ advisor.prominence }}" aria-label="Speak to advisor">
+  <p class="eyebrow">Speak to advisor</p>
+  <h2>{{ advisor.heading }}</h2>
+  <p>{{ advisor.body }}</p>
+  <p class="cta">{{ advisor.cta }}</p>
+  <ul class="contacts">
+    <li>
+      Email
+      <a href="{{ advisor.mailto }}">{{ advisor.email }}</a>
+    </li>
+    <li>
+      Helpline
+      <a href="tel:65922030">{{ advisor.helpline }}</a>
+    </li>
+  </ul>
+</aside>
+
+<section class="card save-card">
+  {% if saved %}
+    <h2>Saved on this computer</h2>
+    <p>You chose to keep this check-in. You can start a new one any time.</p>
+  {% else %}
+    <h2>Save this check-in?</h2>
+    <p>
+      Nothing is stored unless you opt in. Leave this unchecked if you want
+      to keep this check-in private to this page.
+    </p>
+    <form method="post" action="{{ url_for('save_checkin') }}" class="save-form">
+      <label class="opt-in">
+        <input type="checkbox" name="opt_in" value="yes">
+        I want to save this check-in on this computer
+      </label>
+      <button type="submit" class="btn secondary">Save my check-in</button>
+    </form>
+  {% endif %}
+  <p class="more-actions">
+    <a href="{{ url_for('new_checkin') }}">Start another check-in</a>
+  </p>
+</section>
+{% endblock %}
