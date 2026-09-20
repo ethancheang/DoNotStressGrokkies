@@ -18,7 +18,7 @@ Never call save by default. Persist only when BOTH are true:
 
 `full_record` must include student inputs + AI outputs
 (soft_label, tips, speak_prominence, risk_score, risk_category, reasoning)
-with source indicating Gemini (e.g. "gemini"), never "logic_fallback".
+with source "gemini" or post-Logic "ai_logic" (never "logic_fallback").
 """
 
 from __future__ import annotations
@@ -62,6 +62,7 @@ _AI_SUCCESS_SOURCES = frozenset({
     "ai",
     "ai_manager",
     "gemini+logic",
+    "ai_logic",
 })
 
 _REQUIRED_AI_FIELDS = (

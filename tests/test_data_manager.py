@@ -215,3 +215,12 @@ def test_save_allows_ai_ok_flag(tmp_path):
     result = dm.save_record(rec, data_path=str(path), opt_in=True)
     assert result["ok"] is True
 
+def test_save_allows_ai_logic_source(tmp_path):
+    path = tmp_path / "student_records.json"
+    result = dm.save_record(
+        _sample_record(source="ai_logic"),
+        data_path=str(path),
+        opt_in=True,
+    )
+    assert result["ok"] is True
+
