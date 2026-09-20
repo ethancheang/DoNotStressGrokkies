@@ -3,7 +3,12 @@ DoNotStress — AI Processing Layer (ai_manager)
 
 Sole owner of Gemini prompt construction, structured JSON API calls,
 schema validation, and graceful retries.
-Pure procedural Python: functions only — no classes.
+
+Audience: students (local Flask web UI), not advisors.
+Gemini is PRIMARY: it chooses soft_label / tips / speak_prominence
+when available. Business-rule fallback lives in logic_manager — not here.
+
+Pure procedural Python: functions only.
 No terminal I/O (print / input), no Intervention Tier rules, no file persistence.
 
 Pipeline position:
@@ -21,8 +26,62 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Schema
+# I/O fields this layer may send to Gemini (student check-in only)
 # ---------------------------------------------------------------------------
+
+STUDENT_PROMPT_FIELDS = (
+    "student_id",
+    "sleep_hours",
+    "stress_level",
+    "academic_workload",
+    "financial_stress",
+    "social_support",
+    "feelings_text",
+)
+
+# ---------------------------------------------------------------------------
+# Shared allow-lists — logic_manager fallback MUST use the same values
+# ---------------------------------------------------------------------------
+
+# Product form uses a curly apostrophe (U+2019) in "You’re".
+SOFT_LABEL_OK = "You’re doing ok"
+SOFT_LABEL_CHECK_IN = "Worth a check-in"
+SOFT_LABEL_REACH_OUT = "Please reach out"
+SOFT_LABEL_OK_ASCII = "You're doing ok"
+
+ALLOWED_SOFT_LABELS = frozenset(
+    {SOFT_LABEL_OK, SOFT_LABEL_CHECK_IN, SOFT_LABEL_REACH_OUT}
+)
+_SOFT_LABEL_ALIASES = {
+    SOFT_LABEL_OK: SOFT_LABEL_OK,
+    SOFT_LABEL_OK_ASCII: SOFT_LABEL_OK,
+    SOFT_LABEL_CHECK_IN: SOFT_LABEL_CHECK_IN,
+    SOFT_LABEL_REACH_OUT: SOFT_LABEL_REACH_OUT,
+}
+
+ALLOWED_SPEAK_PROMINENCE = frozenset({"low", "medium", "high"})
+ALLOWED_RISK_CATEGORIES = frozenset({"Low", "Moderate", "High"})
+
+ALLOWED_PRIMARY_STRESSORS = frozenset(
+    {
+        "sleep_deprivation",
+        "high_stress",
+        "academic_overload",
+        "financial_pressure",
+        "low_social_support",
+        "emotional_distress",
+    }
+)
+
+ALLOWED_TIPS = (
+    "Keep a regular sleep window and protect at least one rest night this week.",
+    "Try a 10-minute reset between study blocks (walk, water, stretch).",
+    "Break the next assignment into one small first step today.",
+    "Talk to someone you trust about how school has felt lately.",
+    "Check in with SIT Counselling if you want a confidential conversation.",
+    "If money stress is high, ask Student Services about financial support options.",
+)
+ALLOWED_TIPS_SET = frozenset(ALLOWED_TIPS)
 
 _REQUIRED_FIELDS = (
     "risk_score",
@@ -31,55 +90,137 @@ _REQUIRED_FIELDS = (
     "recommended_support",
     "confidence",
     "reasoning",
+    "soft_label",
+    "tips",
+    "speak_prominence",
 )
-_VALID_RISK_CATEGORIES = frozenset({"Low", "Moderate", "High"})
+
 _DEFAULT_MODEL = "gemini-2.0-flash"
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_RETRY_DELAY_SEC = 0.5
+_TIPS_MIN = 1
+_TIPS_MAX = 3
 
 
 def build_prompt(student_dict: dict[str, Any]) -> str:
     """
-    Build a structured prompt from a validated student record (from io_manager).
+    Build a structured prompt from a validated student check-in (from io_manager).
 
-    Instructs Gemini to act as an academic welfare specialist and return
-    ONLY the required JSON fields.
+    Uses only the student-facing fields. Instructs Gemini to act as a
+    supportive student-wellbeing assistant and return ONLY the required JSON.
     """
     payload = {
         "student_id": student_dict.get("student_id"),
         "sleep_hours": student_dict.get("sleep_hours"),
         "stress_level": student_dict.get("stress_level"),
-        "submission_rate": student_dict.get("submission_rate"),
-        "cca_count": student_dict.get("cca_count"),
+        "academic_workload": student_dict.get("academic_workload"),
         "financial_stress": student_dict.get("financial_stress"),
-        "consecutive_absences": student_dict.get("consecutive_absences"),
-        "free_text_concern": student_dict.get("free_text_concern") or "",
+        "social_support": student_dict.get("social_support"),
+        "feelings_text": student_dict.get("feelings_text") or "",
     }
     record_json = json.dumps(payload, ensure_ascii=False, indent=2)
+    stressor_list = ", ".join(sorted(ALLOWED_PRIMARY_STRESSORS))
+    tip_lines = "\n".join(f'  - "{tip}"' for tip in ALLOWED_TIPS)
 
     return (
-        "You are an academic welfare specialist for a Singapore university "
-        "early-warning system (DoNotStress).\n"
-        "Analyse the student welfare indicators holistically and return ONLY "
-        "a single JSON object (no markdown fences, no commentary) with exactly "
-        "these keys:\n"
+        "You are a supportive student-wellbeing assistant for DoNotStress, "
+        "a local check-in tool used by students (not an advisor dashboard).\n"
+        "Speak to the student with warmth and care. Analyse the check-in "
+        "holistically and return ONLY a single JSON object (no markdown "
+        "fences, no commentary) with exactly these keys:\n"
         '- "risk_score": float between 0.0 and 1.0 (composite risk likelihood)\n'
         '- "risk_category": one of "Low", "Moderate", "High"\n'
-        '- "primary_stressors": list of short snake_case strings '
-        '(e.g. "sleep_deprivation", "financial_pressure", '
-        '"academic_disengagement", "high_stress")\n'
-        '- "recommended_support": plain-English recommendation string\n'
+        '- "primary_stressors": list of short snake_case strings chosen ONLY '
+        f"from this allow-list: {stressor_list}\n"
+        '- "recommended_support": short internal string (the UI shows tips, '
+        "not this field)\n"
         '- "confidence": float between 0.0 and 1.0 (your confidence)\n'
-        '- "reasoning": plain-English explanation for an academic advisor\n'
+        '- "reasoning": short plain-English explanation that is safe to show '
+        "a student; do not invent contacts\n"
+        '- "soft_label": EXACTLY one of: "You’re doing ok", '
+        '"Worth a check-in", "Please reach out" '
+        "(use the curly apostrophe in You’re)\n"
+        '- "tips": list of 1 to 3 strings; each tip MUST be copied verbatim '
+        "from this allow-list (do not invent new tips):\n"
+        f"{tip_lines}\n"
+        '- "speak_prominence": one of "low", "medium", "high" — how strongly '
+        "the UI should highlight Speak to advisor (always visible; more "
+        "prominent when risk is higher)\n"
         "\n"
-        "Student record:\n"
+        "Never invent phone numbers, emails, or offices. Do not include "
+        "contact details in JSON. Speak-to-advisor contacts are shown by "
+        "the UI separately.\n"
+        "\n"
+        "Student check-in:\n"
         f"{record_json}\n"
     )
 
 
+def _as_unit_interval(value: Any, field_name: str) -> tuple[bool, Any]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False, f"{field_name} must be a float between 0.0 and 1.0."
+    if number < 0.0 or number > 1.0:
+        return False, f"{field_name} must be between 0.0 and 1.0."
+    return True, number
+
+
+def _normalise_soft_label(value: Any) -> tuple[bool, Any]:
+    if not isinstance(value, str):
+        return False, "soft_label must be a string."
+    label = value.strip()
+    normalised = _SOFT_LABEL_ALIASES.get(label)
+    if normalised is None:
+        return (
+            False,
+            'soft_label must be "You’re doing ok", "Worth a check-in", '
+            'or "Please reach out".',
+        )
+    return True, normalised
+
+
+def _normalise_stressors(value: Any) -> tuple[bool, Any]:
+    if not isinstance(value, list):
+        return False, "primary_stressors must be a list of allow-listed strings."
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return False, "primary_stressors must be a list of strings."
+        name = item.strip()
+        if name not in ALLOWED_PRIMARY_STRESSORS:
+            return False, f"primary_stressor is not on the allow-list: {name}."
+        if name not in seen:
+            seen.add(name)
+            cleaned.append(name)
+    return True, cleaned
+
+
+def _normalise_tips(value: Any) -> tuple[bool, Any]:
+    if not isinstance(value, list):
+        return False, "tips must be a list of 1–3 allow-listed strings."
+    if len(value) < _TIPS_MIN or len(value) > _TIPS_MAX:
+        return False, "tips must contain between 1 and 3 allow-listed strings."
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            return False, "each tip must be a string copied from the allow-list."
+        tip = item.strip()
+        if tip not in ALLOWED_TIPS_SET:
+            return False, f"tip is not on the allow-list: {tip}"
+        if tip not in seen:
+            seen.add(tip)
+            cleaned.append(tip)
+    if not cleaned:
+        return False, "tips must contain between 1 and 3 allow-listed strings."
+    return True, cleaned
+
+
 def validate_ai_response(payload: Any) -> tuple[bool, Any]:
     """
-    Validate Gemini JSON against the required schema.
+    Validate Gemini JSON against the student schema and allow-lists.
 
     Returns (True, normalised_dict) or (False, error_message).
     Never raises for malformed payloads.
@@ -96,47 +237,62 @@ def validate_ai_response(payload: Any) -> tuple[bool, Any]:
     if not isinstance(payload, dict):
         return False, "AI response must be a JSON object."
 
-    missing = [k for k in _REQUIRED_FIELDS if k not in payload]
+    missing = [key for key in _REQUIRED_FIELDS if key not in payload]
     if missing:
         return False, f"AI response missing required fields: {', '.join(missing)}."
 
-    try:
-        risk_score = float(payload["risk_score"])
-    except (TypeError, ValueError):
-        return False, "risk_score must be a float between 0.0 and 1.0."
-    if risk_score < 0.0 or risk_score > 1.0:
-        return False, "risk_score must be between 0.0 and 1.0."
+    score_ok, risk_score = _as_unit_interval(payload["risk_score"], "risk_score")
+    if not score_ok:
+        return False, risk_score
 
     risk_category = payload["risk_category"]
-    if not isinstance(risk_category, str) or risk_category not in _VALID_RISK_CATEGORIES:
+    if (
+        not isinstance(risk_category, str)
+        or risk_category not in ALLOWED_RISK_CATEGORIES
+    ):
         return False, 'risk_category must be "Low", "Moderate", or "High".'
 
-    stressors = payload["primary_stressors"]
-    if not isinstance(stressors, list) or not all(isinstance(s, str) for s in stressors):
-        return False, "primary_stressors must be a list of strings."
+    stressors_ok, stressors = _normalise_stressors(payload["primary_stressors"])
+    if not stressors_ok:
+        return False, stressors
 
     recommended = payload["recommended_support"]
     if not isinstance(recommended, str) or not recommended.strip():
         return False, "recommended_support must be a non-empty string."
 
-    try:
-        confidence = float(payload["confidence"])
-    except (TypeError, ValueError):
-        return False, "confidence must be a float between 0.0 and 1.0."
-    if confidence < 0.0 or confidence > 1.0:
-        return False, "confidence must be between 0.0 and 1.0."
+    conf_ok, confidence = _as_unit_interval(payload["confidence"], "confidence")
+    if not conf_ok:
+        return False, confidence
 
     reasoning = payload["reasoning"]
     if not isinstance(reasoning, str) or not reasoning.strip():
         return False, "reasoning must be a non-empty string."
 
+    label_ok, soft_label = _normalise_soft_label(payload["soft_label"])
+    if not label_ok:
+        return False, soft_label
+
+    tips_ok, tips = _normalise_tips(payload["tips"])
+    if not tips_ok:
+        return False, tips
+
+    speak_prominence = payload["speak_prominence"]
+    if (
+        not isinstance(speak_prominence, str)
+        or speak_prominence.strip() not in ALLOWED_SPEAK_PROMINENCE
+    ):
+        return False, 'speak_prominence must be "low", "medium", or "high".'
+
     normalised = {
         "risk_score": risk_score,
         "risk_category": risk_category,
-        "primary_stressors": list(stressors),
+        "primary_stressors": stressors,
         "recommended_support": recommended.strip(),
         "confidence": confidence,
         "reasoning": reasoning.strip(),
+        "soft_label": soft_label,
+        "tips": tips,
+        "speak_prominence": speak_prominence.strip(),
     }
     return True, normalised
 
@@ -144,6 +300,7 @@ def validate_ai_response(payload: Any) -> tuple[bool, Any]:
 def _default_generate(prompt: str, api_key: str, model_name: str) -> str:
     """
     Real Gemini call (structured JSON). Isolated so tests can inject a stub.
+    Reads the key from the caller; never hardcode GEMINI_API_KEY.
     """
     import google.generativeai as genai
 
@@ -226,7 +383,7 @@ def analyse_student(
     Entry point for the AI Processing Layer.
 
     Builds prompt → calls Gemini → validates schema → merges AI fields into
-    a shallow copy of the student record for logic_manager.
+    a shallow copy of the student record for logic_manager / the Flask UI.
 
     Returns (ok, enriched_record_or_None, error_or_None). Never raises for
     API / schema failures.
