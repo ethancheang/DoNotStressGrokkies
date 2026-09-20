@@ -5,18 +5,20 @@ Sole owner of flat-file persistence for evaluated student check-in records.
 Pure procedural Python: functions only — no classes.
 No terminal I/O (print / input), no AI calls, no soft-label / tier rules.
 
-Flask / web usage (opt-in only)
---------------------------------
-Never call save by default. Persist only after the student explicitly consents
-on the result page, then:
+Flask / web usage (opt-in + AI-success only)
+---------------------------------------------
+Never call save by default. Persist only when BOTH are true:
+  1. the student explicitly consents on the result page (opt_in=True)
+  2. the record is a successful Gemini-processed result (not logic_fallback)
 
     from data_manager import save_record
 
     result = save_record(full_record, opt_in=True)
-    # result["ok"] is False if opt_in is missing/false — nothing is written.
+    # refused if opt_in is false OR source is logic_fallback / AI fields missing
 
-`full_record` should include student inputs + analysis outputs
-(soft_label, tips, speak_prominence, risk fields, reasoning, source=gemini|fallback).
+`full_record` must include student inputs + AI outputs
+(soft_label, tips, speak_prominence, risk_score, risk_category, reasoning)
+with source indicating Gemini (e.g. "gemini"), never "logic_fallback".
 """
 
 from __future__ import annotations
@@ -46,6 +48,32 @@ def _resolve_path(data_path: str | None) -> Path:
     return Path(data_path)
 
 
+# Sources that mean Gemini never successfully processed this record.
+_BLOCKED_SOURCES = frozenset({
+    "logic_fallback",
+    "fallback",
+    "logic_only",
+    "logic",
+})
+
+# Accepted markers that the Gemini path succeeded (Logic may refine later).
+_AI_SUCCESS_SOURCES = frozenset({
+    "gemini",
+    "ai",
+    "ai_manager",
+    "gemini+logic",
+})
+
+_REQUIRED_AI_FIELDS = (
+    "soft_label",
+    "tips",
+    "speak_prominence",
+    "risk_score",
+    "risk_category",
+    "reasoning",
+)
+
+
 def _is_opted_in(opt_in: Any) -> bool:
     """True only for explicit consent: True, or common truthy form values."""
     if opt_in is True:
@@ -53,6 +81,37 @@ def _is_opted_in(opt_in: Any) -> bool:
     if isinstance(opt_in, str) and opt_in.strip().lower() in {"1", "true", "yes", "on"}:
         return True
     return False
+
+
+def _ai_success_error(record: dict[str, Any]) -> str | None:
+    """
+    Return an error string if the record is not a successful AI-processed result.
+    Fail closed: missing source / missing AI fields / logic_fallback → refuse save.
+    """
+    if not isinstance(record, dict):
+        return "record must be a dict"
+
+    source = str(record.get("source", "")).strip().lower()
+    if source in _BLOCKED_SOURCES:
+        return (
+            "Save refused: record is not AI-processed "
+            f"(source={record.get('source')!r})."
+        )
+
+    explicit_ok = record.get("ai_ok") is True
+    source_ok = source in _AI_SUCCESS_SOURCES
+    if not explicit_ok and not source_ok:
+        return (
+            "Save refused: successful Gemini processing required "
+            "(set source to 'gemini' or ai_ok=True)."
+        )
+
+    missing = [name for name in _REQUIRED_AI_FIELDS if name not in record]
+    if missing:
+        return (
+            "Save refused: AI fields missing: " + ", ".join(missing) + "."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +194,11 @@ def save_record(
     opt_in: Any = False,
 ) -> dict[str, Any]:
     """
-    Append one evaluated student record **only if opt_in is explicit consent**.
+    Append one evaluated student record only if:
+      - opt_in is explicit consent, AND
+      - the record is a successful AI-processed result (not logic_fallback).
 
-    Default is no save: call with opt_in=True after the student opts in on the UI.
-    Adds saved_at (UTC ISO) and save_opt_in=True on the stored row.
+    Default is no save. Adds saved_at (UTC ISO) and save_opt_in=True on the row.
     Returns {"ok": bool, "error": str|None, "path": str, "record": dict|None}.
     """
     path = _resolve_path(data_path)
@@ -155,6 +215,15 @@ def save_record(
         return {
             "ok": False,
             "error": "record must be a dict",
+            "path": str(path),
+            "record": None,
+        }
+
+    ai_err = _ai_success_error(record)
+    if ai_err is not None:
+        return {
+            "ok": False,
+            "error": ai_err,
             "path": str(path),
             "record": None,
         }
