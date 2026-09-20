@@ -56,17 +56,21 @@ def test_allowlists_match_io_manager_pr6():
         "Worth a check-in",
         "Please reach out",
     )
-    assert am.TIPS_ALLOWLIST == (
-        "sleep_routine",
-        "rest_a_little_more",
-        "short_breaks",
-        "workload_chunks",
-        "money_worries",
-        "talk_to_someone",
-        "keep_social_contact",
-        "feelings_check_in",
+    assert am.ALLOWED_TIP_IDS == frozenset(
+        {
+            "sleep_routine",
+            "rest_a_little_more",
+            "short_breaks",
+            "workload_chunks",
+            "money_worries",
+            "talk_to_someone",
+            "keep_social_contact",
+            "feelings_check_in",
+        }
     )
     assert am.SPEAK_PROMINENCE == ("low", "medium", "high")
+    assert not hasattr(am, "ALLOWED_TIPS")
+    assert not hasattr(am, "TIPS_ALLOWLIST")
 
 
 def test_build_prompt_includes_feelings_text_and_student_fields():
@@ -84,7 +88,7 @@ def test_build_prompt_includes_feelings_text_and_student_fields():
     assert "Do not include contact details in JSON" in prompt
     assert "You're doing ok" in prompt
     assert "tip IDs" in prompt
-    for tip_id in am.TIPS_ALLOWLIST:
+    for tip_id in am.ALLOWED_TIP_IDS:
         assert tip_id in prompt
 
 
@@ -208,7 +212,12 @@ def test_validate_rejects_empty_or_too_many_tips():
     assert "tips" in err
 
     too_many = dict(VALID_AI)
-    too_many["tips"] = list(am.TIPS_ALLOWLIST[:4])
+    too_many["tips"] = [
+        "sleep_routine",
+        "rest_a_little_more",
+        "short_breaks",
+        "workload_chunks",
+    ]
     ok, err = am.validate_ai_response(too_many)
     assert ok is False
     assert "tips" in err
@@ -362,3 +371,18 @@ def test_module_does_not_hardcode_gemini_key():
     source = open(am.__file__, encoding="utf-8").read()
     assert "AIza" not in source
     assert "os.environ.get(\"GEMINI_API_KEY\"" in source
+
+
+def test_module_has_no_invented_tip_sentences():
+    source = open(am.__file__, encoding="utf-8").read()
+    assert "ALLOWED_TIPS =" not in source
+    invented = (
+        "Keep a regular sleep window",
+        "Try a 10-minute reset",
+        "Break the next assignment",
+        "Talk to someone you trust about how school has felt lately.",
+        "Check in with SIT Counselling if you want a confidential conversation.",
+        "If money stress is high, ask Student Services",
+    )
+    for sentence in invented:
+        assert sentence not in source

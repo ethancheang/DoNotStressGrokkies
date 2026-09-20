@@ -79,17 +79,18 @@ ALLOWED_PRIMARY_STRESSORS = frozenset(
 )
 
 # IDs only — same keys as io_manager.TIPS_ALLOWLIST. Do not invent tip text.
-TIPS_ALLOWLIST = (
-    "sleep_routine",
-    "rest_a_little_more",
-    "short_breaks",
-    "workload_chunks",
-    "money_worries",
-    "talk_to_someone",
-    "keep_social_contact",
-    "feelings_check_in",
+ALLOWED_TIP_IDS = frozenset(
+    {
+        "sleep_routine",
+        "rest_a_little_more",
+        "short_breaks",
+        "workload_chunks",
+        "money_worries",
+        "talk_to_someone",
+        "keep_social_contact",
+        "feelings_check_in",
+    }
 )
-ALLOWED_TIP_IDS = frozenset(TIPS_ALLOWLIST)
 
 _REQUIRED_FIELDS = (
     "risk_score",
@@ -128,7 +129,7 @@ def build_prompt(student_dict: dict[str, Any]) -> str:
     }
     record_json = json.dumps(payload, ensure_ascii=False, indent=2)
     stressor_list = ", ".join(sorted(ALLOWED_PRIMARY_STRESSORS))
-    tip_id_list = ", ".join(TIPS_ALLOWLIST)
+    tip_id_list = ", ".join(sorted(ALLOWED_TIP_IDS))
     soft_label_list = ", ".join(f'"{label}"' for label in SOFT_LABELS)
 
     return (
