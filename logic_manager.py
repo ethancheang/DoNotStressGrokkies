@@ -1,7 +1,10 @@
 """
 DoNotStress — Logic Layer (logic_manager)
 
-Sole owner of Intervention Tier assignment (domain brain).
+FALLBACK decision engine when Gemini / ai_manager fails.
+Produces the same UI-facing outcome fields as the AI path so the Flask
+result page can render identically.
+
 Pure procedural Python: functions only — no classes.
 No terminal I/O (print / input), no Gemini / network, no file I/O.
 
@@ -14,165 +17,343 @@ from __future__ import annotations
 from typing import Any
 
 
-def assign_intervention_tier(record: dict[str, Any]) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Locked allow-lists (AI / I/O layers should mirror these exact strings)
+# ---------------------------------------------------------------------------
+
+SOFT_LABELS = (
+    "You're doing ok",
+    "Worth a check-in",
+    "Please reach out",
+)
+
+SPEAK_PROMINENCE = ("low", "medium", "high")
+
+ALLOWED_TIPS = (
+    "Keep a steady sleep schedule this week.",
+    "Take short breaks between study blocks.",
+    "Break big tasks into smaller steps.",
+    "Reach out to a friend or family member.",
+    "Try a short walk or stretch when stress spikes.",
+    "Check campus wellbeing resources if things feel heavy.",
+    "Talk with an academic advisor about workload.",
+    "Consider a budgeting or financial-aid check-in.",
+)
+
+RISK_CATEGORIES = ("Low", "Moderate", "High")
+LOGIC_SOURCE = "logic_fallback"
+
+# Numeric inputs used by fallback rules. feelings_text is accepted on the
+# record but never read here — AI may use it; this layer is numeric only.
+# student_id is pass-through via apply_soft_outcome, not used in rules.
+_SLEEP_DEFAULT = 8.0
+_STRESS_DEFAULT = 3
+_WORKLOAD_DEFAULT = 3
+_FINANCIAL_DEFAULT = 2
+_SUPPORT_DEFAULT = 8
+
+# Tip indices into ALLOWED_TIPS (keeps selection aligned with the allow-list).
+_TIP_SLEEP = ALLOWED_TIPS[0]
+_TIP_BREAKS = ALLOWED_TIPS[1]
+_TIP_SMALL_STEPS = ALLOWED_TIPS[2]
+_TIP_FRIEND = ALLOWED_TIPS[3]
+_TIP_WALK = ALLOWED_TIPS[4]
+_TIP_WELLBEING = ALLOWED_TIPS[5]
+_TIP_ADVISOR = ALLOWED_TIPS[6]
+_TIP_FINANCIAL = ALLOWED_TIPS[7]
+
+_MIN_TIPS = 2
+_MAX_TIPS = 4
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def assign_soft_outcome(record: dict[str, Any]) -> dict[str, Any]:
     """
-    Map a combined student + AI record to an Intervention Tier.
+    Map student numeric fields to a soft UI outcome (Gemini fallback).
 
-    Expected keys (I/O + AI):
-      risk_score: float (0.0–1.0)
-      consecutive_absences: int (>= 0)
-      financial_stress: bool
-      primary_stressors: list[str]
-      submission_rate: float (0.0–100.0)
-        (alias: assignment_submission_rate)
-      risk_category: str ("Low" | "Moderate" | "High")
-      sleep_hours: float
-        (alias: average_sleep_hours)
-      stress_level: int (1–10)
+    Expected keys (new student-facing inputs only):
+      student_id: str          — ignored by rules; preserved by apply_soft_outcome
+      sleep_hours: float       — typically 0–24, 0.5 steps
+      stress_level: int        — 1–10
+      academic_workload: int   — 1–10
+      financial_stress: int    — 1–10 (scale, not bool)
+      social_support: int      — 1–10
+      feelings_text: str       — optional; NOT used in fallback rules
 
-    Returns:
-      {
-        "tier": int,                 # 1–4
-        "intervention_tier": int,    # same as tier (Data Manager key)
-        "label": str,                # Critical | Urgent | Monitor | Clear
-        "tier_label": str,           # same as label
-        "colour": str,               # Red | Orange | Yellow | Green
-        "rule": str,                 # which rule fired, or "default_clear"
-        "action": str,               # recommended next step
-        "outcome": str,              # same as action (Data Manager key)
-      }
+    Severity bands (first matching highest-severity rule wins):
+
+    Please reach out / speak_prominence high / risk_category High when ANY of:
+      1. stress_level >= 8 AND sleep_hours <= 5.0
+      2. stress_level >= 8 AND academic_workload >= 8 AND social_support <= 3
+      3. financial_stress >= 8 AND stress_level >= 7 AND social_support <= 4
+
+    Worth a check-in / speak_prominence medium / Moderate when ANY of:
+      1. stress_level >= 6 AND (sleep_hours < 6.0 OR academic_workload >= 7)
+      2. financial_stress >= 7 AND social_support <= 5
+      3. academic_workload >= 8 AND sleep_hours < 6.5
+
+    You're doing ok / speak_prominence low / Low: default
+
+    risk_score is a separate 0.0–1.0 logging heuristic (see _risk_score).
     """
-    if _rule_1_critical_escalation(record):
-        return _tier_result(
-            tier=1,
-            label="Critical",
-            colour="Red",
-            rule="critical_escalation",
-            action="Escalate to Dean's Office immediately.",
-        )
+    sleep, stress, workload, financial, support = _read_numeric_fields(record)
+    flags = _signal_flags(sleep, stress, workload, financial, support)
 
-    if _rule_2_urgent_financial(record):
-        return _tier_result(
-            tier=2,
-            label="Urgent",
-            colour="Orange",
-            rule="urgent_financial",
-            action="Refer to Financial Aid Office and Student Counsellor.",
-        )
+    band, rule_id = _winning_band(flags)
+    tips = _select_tips(flags, band)
+    reasoning = _reasoning(rule_id, sleep, stress, workload, financial, support)
+    score = _risk_score(sleep, stress, workload, financial, support)
 
-    if _rule_3_academic_watch(record):
-        return _tier_result(
-            tier=3,
-            label="Monitor",
-            colour="Yellow",
-            rule="academic_watch",
-            action="Flag for Academic Advisor follow-up within two weeks.",
-        )
-
-    if _rule_4_physical_wellness(record):
-        return _tier_result(
-            tier=3,
-            label="Monitor",
-            colour="Yellow",
-            rule="physical_wellness",
-            action="Recommend Wellness Workshop and peer-support resources.",
-        )
-
-    # Rule 5 — Default Clear
-    return _tier_result(
-        tier=4,
-        label="Clear",
-        colour="Green",
-        rule="default_clear",
-        action="No immediate action. Record saved for trend tracking.",
-    )
+    return {
+        "soft_label": _BAND_TO_LABEL[band],
+        "tips": tips,
+        "speak_prominence": _BAND_TO_PROMINENCE[band],
+        "risk_score": score,
+        "risk_category": _BAND_TO_CATEGORY[band],
+        "reasoning": reasoning,
+        "source": LOGIC_SOURCE,
+    }
 
 
-def apply_intervention_tier(record: dict[str, Any]) -> dict[str, Any]:
+def apply_soft_outcome(record: dict[str, Any]) -> dict[str, Any]:
     """
     Return a shallow copy of `record` with Logic outcome fields merged in.
-    Use this before handing off to data_manager.save_record(...).
+    Does not mutate the original dict. Use before data_manager.save_record.
     """
-    outcome = assign_intervention_tier(record)
-    enriched = dict(record)
+    source = record if isinstance(record, dict) else {}
+    outcome = assign_soft_outcome(source)
+    enriched = dict(source)
     enriched.update(outcome)
     return enriched
 
 
-def _tier_result(
-    tier: int,
-    label: str,
-    colour: str,
-    rule: str,
-    action: str,
-) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Band tables (aligned: label ↔ prominence ↔ category)
+# ---------------------------------------------------------------------------
+
+_BAND_TO_LABEL = {
+    "high": SOFT_LABELS[2],
+    "medium": SOFT_LABELS[1],
+    "low": SOFT_LABELS[0],
+}
+_BAND_TO_PROMINENCE = {
+    "high": SPEAK_PROMINENCE[2],
+    "medium": SPEAK_PROMINENCE[1],
+    "low": SPEAK_PROMINENCE[0],
+}
+_BAND_TO_CATEGORY = {
+    "high": RISK_CATEGORIES[2],
+    "medium": RISK_CATEGORIES[1],
+    "low": RISK_CATEGORIES[0],
+}
+
+
+# ---------------------------------------------------------------------------
+# Field readers (numeric only — feelings_text / student_id unused)
+# ---------------------------------------------------------------------------
+
+def _read_numeric_fields(record: dict[str, Any]) -> tuple[float, int, int, int, int]:
+    data = record if isinstance(record, dict) else {}
+    sleep = _as_float(data.get("sleep_hours"), _SLEEP_DEFAULT)
+    stress = _as_int(data.get("stress_level"), _STRESS_DEFAULT)
+    workload = _as_int(data.get("academic_workload"), _WORKLOAD_DEFAULT)
+    financial = _as_int(data.get("financial_stress"), _FINANCIAL_DEFAULT)
+    support = _as_int(data.get("social_support"), _SUPPORT_DEFAULT)
+    return sleep, stress, workload, financial, support
+
+
+def _as_float(value: Any, default: float) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    if number == float("inf") or number == float("-inf"):
+        return default
+    return number
+
+
+def _as_int(value: Any, default: int) -> int:
+    number = _as_float(value, float(default))
+    return int(round(number))
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    if value < lo:
+        return lo
+    if value > hi:
+        return hi
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Signals and rules
+# ---------------------------------------------------------------------------
+
+def _signal_flags(
+    sleep: float,
+    stress: int,
+    workload: int,
+    financial: int,
+    support: int,
+) -> dict[str, bool]:
     return {
-        "tier": tier,
-        "intervention_tier": tier,
-        "label": label,
-        "tier_label": label,
-        "colour": colour,
-        "rule": rule,
-        "action": action,
-        "outcome": action,
+        "sleep_very_low": sleep <= 5.0,
+        "sleep_low": sleep < 6.0,
+        "sleep_short": sleep < 6.5,
+        "stress_very_high": stress >= 8,
+        "stress_high": stress >= 7,
+        "stress_elevated": stress >= 6,
+        "workload_high": workload >= 8,
+        "workload_elevated": workload >= 7,
+        "financial_high": financial >= 8,
+        "financial_elevated": financial >= 7,
+        "support_very_low": support <= 3,
+        "support_low": support <= 4,
+        "support_somewhat_low": support <= 5,
     }
 
 
-def _field(record: dict[str, Any], *keys: str, default: Any = None) -> Any:
-    for key in keys:
-        if key in record and record[key] is not None:
-            return record[key]
-    return default
+def _winning_band(flags: dict[str, bool]) -> tuple[str, str]:
+    """Return (band, rule_id). Highest severity first."""
+    if flags["stress_very_high"] and flags["sleep_very_low"]:
+        return "high", "high_stress_low_sleep"
+    if flags["stress_very_high"] and flags["workload_high"] and flags["support_very_low"]:
+        return "high", "high_stress_workload_low_support"
+    if flags["financial_high"] and flags["stress_high"] and flags["support_low"]:
+        return "high", "high_financial_stress_low_support"
+
+    if flags["stress_elevated"] and (flags["sleep_low"] or flags["workload_elevated"]):
+        return "medium", "elevated_stress_sleep_or_workload"
+    if flags["financial_elevated"] and flags["support_somewhat_low"]:
+        return "medium", "financial_and_low_support"
+    if flags["workload_high"] and flags["sleep_short"]:
+        return "medium", "high_workload_short_sleep"
+
+    return "low", "default_ok"
 
 
-def _rule_1_critical_escalation(record: dict[str, Any]) -> bool:
-    """Tier 1: risk_score > 0.75 AND consecutive_absences >= 3."""
-    risk_score = _field(record, "risk_score", default=0.0)
-    consecutive_absences = _field(record, "consecutive_absences", default=0)
-    return risk_score > 0.75 and consecutive_absences >= 3
+# ---------------------------------------------------------------------------
+# risk_score heuristic (logging only; category follows the rule band)
+# ---------------------------------------------------------------------------
 
-
-def _rule_2_urgent_financial(record: dict[str, Any]) -> bool:
+def _risk_score(
+    sleep: float,
+    stress: int,
+    workload: int,
+    financial: int,
+    support: int,
+) -> float:
     """
-    Tier 2: risk_score > 0.65
-             AND financial_stress is True
-             AND "financial_pressure" in primary_stressors.
+    Composite in [0.0, 1.0]. Higher is more concerning.
+
+    Normalize each field to [0, 1] (higher = worse):
+      stress_n     = clamp((stress_level - 1) / 9, 0, 1)
+      workload_n   = clamp((academic_workload - 1) / 9, 0, 1)
+      financial_n  = clamp((financial_stress - 1) / 9, 0, 1)
+      support_n    = clamp((10 - social_support) / 9, 0, 1)   # low support → high
+      sleep_n      = clamp((8.0 - sleep_hours) / 8.0, 0, 1)   # 8h+ → 0, 0h → 1
+
+    Weighted sum (weights total 1.0):
+      0.30 * stress_n
+    + 0.20 * sleep_n
+    + 0.20 * workload_n
+    + 0.15 * financial_n
+    + 0.15 * support_n
     """
-    risk_score = _field(record, "risk_score", default=0.0)
-    financial_stress = _field(record, "financial_stress", default=False)
-    primary_stressors = _field(record, "primary_stressors", default=[]) or []
-    return (
-        risk_score > 0.65
-        and financial_stress is True
-        and "financial_pressure" in primary_stressors
+    stress_n = _clamp((float(stress) - 1.0) / 9.0, 0.0, 1.0)
+    workload_n = _clamp((float(workload) - 1.0) / 9.0, 0.0, 1.0)
+    financial_n = _clamp((float(financial) - 1.0) / 9.0, 0.0, 1.0)
+    support_n = _clamp((10.0 - float(support)) / 9.0, 0.0, 1.0)
+    sleep_n = _clamp((8.0 - float(sleep)) / 8.0, 0.0, 1.0)
+    score = (
+        0.30 * stress_n
+        + 0.20 * sleep_n
+        + 0.20 * workload_n
+        + 0.15 * financial_n
+        + 0.15 * support_n
     )
+    return round(_clamp(score, 0.0, 1.0), 4)
 
 
-def _rule_3_academic_watch(record: dict[str, Any]) -> bool:
-    """
-    Tier 3: submission_rate < 50.0
-            AND risk_category == "High"
-            AND consecutive_absences >= 1.
-    """
-    submission_rate = _field(
-        record, "submission_rate", "assignment_submission_rate", default=100.0
+# ---------------------------------------------------------------------------
+# Tips — subset of ALLOWED_TIPS, 2–4 unique items, driven by fired signals
+# ---------------------------------------------------------------------------
+
+def _select_tips(flags: dict[str, bool], band: str) -> list[str]:
+    ordered: list[str] = []
+
+    if band == "high":
+        ordered.append(_TIP_WELLBEING)
+    if flags["sleep_short"]:
+        ordered.append(_TIP_SLEEP)
+    if flags["stress_elevated"]:
+        ordered.append(_TIP_WALK)
+    if flags["workload_high"]:
+        ordered.append(_TIP_ADVISOR)
+        ordered.append(_TIP_SMALL_STEPS)
+    elif flags["workload_elevated"]:
+        ordered.append(_TIP_BREAKS)
+        ordered.append(_TIP_SMALL_STEPS)
+    if flags["financial_elevated"]:
+        ordered.append(_TIP_FINANCIAL)
+    if flags["support_somewhat_low"]:
+        ordered.append(_TIP_FRIEND)
+
+    unique: list[str] = []
+    for tip in ordered:
+        if tip in ALLOWED_TIPS and tip not in unique:
+            unique.append(tip)
+
+    pad_order = (_TIP_SLEEP, _TIP_BREAKS, _TIP_WALK)
+    for tip in pad_order:
+        if len(unique) >= _MIN_TIPS:
+            break
+        if tip not in unique:
+            unique.append(tip)
+
+    return unique[:_MAX_TIPS]
+
+
+def _reasoning(
+    rule_id: str,
+    sleep: float,
+    stress: int,
+    workload: int,
+    financial: int,
+    support: int,
+) -> str:
+    details = (
+        f"sleep_hours={sleep:g}, stress_level={stress}, "
+        f"academic_workload={workload}, financial_stress={financial}, "
+        f"social_support={support}"
     )
-    risk_category = _field(record, "risk_category", default="")
-    consecutive_absences = _field(record, "consecutive_absences", default=0)
-    return (
-        submission_rate < 50.0
-        and risk_category == "High"
-        and consecutive_absences >= 1
-    )
-
-
-def _rule_4_physical_wellness(record: dict[str, Any]) -> bool:
-    """
-    Tier 3: sleep_hours < 5.5
-            AND stress_level >= 7
-            AND risk_score > 0.5.
-    """
-    sleep_hours = _field(record, "sleep_hours", "average_sleep_hours", default=24.0)
-    stress_level = _field(record, "stress_level", default=0)
-    risk_score = _field(record, "risk_score", default=0.0)
-    return sleep_hours < 5.5 and stress_level >= 7 and risk_score > 0.5
+    explanations = {
+        "high_stress_low_sleep": (
+            "Please reach out: high stress combined with very low sleep"
+        ),
+        "high_stress_workload_low_support": (
+            "Please reach out: high stress, heavy workload, and low social support"
+        ),
+        "high_financial_stress_low_support": (
+            "Please reach out: high financial stress with elevated stress and low support"
+        ),
+        "elevated_stress_sleep_or_workload": (
+            "Worth a check-in: elevated stress with short sleep or heavy workload"
+        ),
+        "financial_and_low_support": (
+            "Worth a check-in: financial strain with limited social support"
+        ),
+        "high_workload_short_sleep": (
+            "Worth a check-in: heavy academic workload with short sleep"
+        ),
+        "default_ok": "You're doing ok: no high-severity numeric signals fired",
+    }
+    lead = explanations.get(rule_id, "Numeric fallback outcome")
+    return f"{lead} ({details})."
