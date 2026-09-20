@@ -174,3 +174,53 @@ def test_wrapped_records_object_format(tmp_path):
 def test_get_default_data_path():
     p = dm.get_default_data_path()
     assert p.endswith("data/student_records.json")
+
+def test_save_refused_for_logic_fallback(tmp_path):
+    path = tmp_path / "student_records.json"
+    result = dm.save_record(
+        _sample_record(source="logic_fallback"),
+        data_path=str(path),
+        opt_in=True,
+    )
+    assert result["ok"] is False
+    assert "AI-processed" in result["error"] or "logic_fallback" in result["error"]
+    assert not path.exists()
+
+
+def test_save_refused_without_ai_source(tmp_path):
+    path = tmp_path / "student_records.json"
+    rec = _sample_record()
+    rec.pop("source", None)
+    result = dm.save_record(rec, data_path=str(path), opt_in=True)
+    assert result["ok"] is False
+    assert "Gemini" in result["error"] or "AI" in result["error"]
+    assert not path.exists()
+
+
+def test_save_refused_when_ai_fields_missing(tmp_path):
+    path = tmp_path / "student_records.json"
+    rec = _sample_record(source="gemini")
+    del rec["risk_score"]
+    result = dm.save_record(rec, data_path=str(path), opt_in=True)
+    assert result["ok"] is False
+    assert "missing" in result["error"].lower()
+    assert not path.exists()
+
+
+def test_save_allows_ai_ok_flag(tmp_path):
+    path = tmp_path / "student_records.json"
+    rec = _sample_record()
+    rec.pop("source", None)
+    rec["ai_ok"] = True
+    result = dm.save_record(rec, data_path=str(path), opt_in=True)
+    assert result["ok"] is True
+
+def test_save_allows_ai_logic_source(tmp_path):
+    path = tmp_path / "student_records.json"
+    result = dm.save_record(
+        _sample_record(source="ai_logic"),
+        data_path=str(path),
+        opt_in=True,
+    )
+    assert result["ok"] is True
+
