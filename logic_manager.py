@@ -289,22 +289,24 @@ def _risk_score(
 def _select_tips(flags: dict[str, bool], band: str) -> list[str]:
     ordered: list[str] = []
 
+    # Order so rule-critical signals (sleep, stress, support, financial)
+    # land in the 2–4 tip window before extra workload suggestions.
     if band == "high":
         ordered.append(_TIP_WELLBEING)
     if flags["sleep_short"]:
         ordered.append(_TIP_SLEEP)
     if flags["stress_elevated"]:
         ordered.append(_TIP_WALK)
+    if flags["support_somewhat_low"]:
+        ordered.append(_TIP_FRIEND)
+    if flags["financial_elevated"]:
+        ordered.append(_TIP_FINANCIAL)
     if flags["workload_high"]:
         ordered.append(_TIP_ADVISOR)
         ordered.append(_TIP_SMALL_STEPS)
     elif flags["workload_elevated"]:
         ordered.append(_TIP_BREAKS)
         ordered.append(_TIP_SMALL_STEPS)
-    if flags["financial_elevated"]:
-        ordered.append(_TIP_FINANCIAL)
-    if flags["support_somewhat_low"]:
-        ordered.append(_TIP_FRIEND)
 
     unique: list[str] = []
     for tip in ordered:
