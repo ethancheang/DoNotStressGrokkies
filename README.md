@@ -1,6 +1,8 @@
 # DoNotStressGrokkies
 
-Local Flask check-in for **students** (not advisors). You answer a short form, see a soft outcome plus tips, and can contact SIT Counselling. Nothing is written to disk unless you opt in on the result page.
+Local Flask check-in for **students** (not advisors). You answer a short form, Gemini analyses it, Logic finalizes the AI-enriched record, and you can contact SIT Counselling. Nothing is written to disk unless you opt in on the result page.
+
+Gemini is **required**. There is no Logic-only / fake-tips path when the API key is missing or Gemini fails.
 
 ## Setup
 
@@ -10,9 +12,9 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Gemini API key (optional)
+## Gemini API key (required)
 
-The app tries `ai_manager.analyse_student(...)` first. That needs a Google Gemini key in the environment:
+Every check-in calls `ai_manager.analyse_student(...)`. Set a Google Gemini key in the environment:
 
 ```bash
 export GEMINI_API_KEY="your-key-here"
@@ -24,7 +26,7 @@ Windows (PowerShell):
 $env:GEMINI_API_KEY="your-key-here"
 ```
 
-Create a key in [Google AI Studio](https://aistudio.google.com/apikey). If the key is missing or Gemini fails, the app falls back to `logic_manager.apply_soft_outcome(...)` and still shows a result.
+Create a key in [Google AI Studio](https://aistudio.google.com/apikey). If the key is missing or Gemini fails, the app shows an AI-required error page (with official counselling contacts). It does **not** invent `soft_label` / tips from the form numbers alone.
 
 ## Run locally
 
@@ -52,10 +54,11 @@ Optional:
 ## What happens after submit
 
 1. `io_manager.validate_student_form(...)` checks the form.
-2. Gemini is tried via `ai_manager.analyse_student(...)`.
-3. On AI failure, `logic_manager.assign_soft_outcome` / `apply_soft_outcome` is used.
-4. The result page uses `format_soft_label`, `format_tips`, and `format_speak_to_advisor_panel`.
-5. Save runs only if you tick the box and click **Save my check-in**, which calls `data_manager.save_record(record, opt_in=True)`.
+2. Gemini **must** succeed via `ai_manager.analyse_student(...)`.
+3. On AI failure, `io_manager.format_ai_error(...)` / `format_ai_unavailable_error` builds the error page. Logic is not used as a product substitute.
+4. On AI success only, `logic_manager.apply_logic(...)` (alias `finalize_outcome`) finalizes the record (`source` becomes `ai_logic`).
+5. The result page uses `format_soft_label`, `format_tips`, and `format_speak_to_advisor_panel`.
+6. Save runs only if you tick the box and click **Save my check-in**, which calls `data_manager.save_record(record, opt_in=True)` for successful AI-processed records.
 
 ## Support contacts
 
