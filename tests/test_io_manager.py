@@ -496,6 +496,167 @@ def test_format_speak_to_advisor_panel_does_not_print():
 
 
 # ---------------------------------------------------------------------------
+# format_ai_unavailable_error / format_ai_error
+# ---------------------------------------------------------------------------
+
+OFFICIAL_CONTACTS = {
+    "SITCounselling@SingaporeTech.edu.sg",
+    "6592 2030",
+    "mailto:SITCounselling@SingaporeTech.edu.sg",
+}
+
+AI_ERROR_DICT_KEYS = {
+    "heading",
+    "body",
+    "message",
+    "hint",
+    "action_label",
+    "tone",
+    "ai_required",
+    "error_code",
+    "reason",
+    "speak_to_advisor",
+    "email",
+    "helpline",
+    "mailto",
+    "contacts",
+    "error",
+}
+
+
+def _walk_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_strings(item)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _walk_strings(item)
+
+
+def _assert_ai_error_shape(copy):
+    assert set(copy) == AI_ERROR_DICT_KEYS
+    assert copy["heading"] == "We couldn't complete your check-in"
+    assert copy["body"]
+    assert copy["message"] == copy["body"]
+    assert "AI" in copy["body"] or "Gemini" in copy["body"]
+    assert "try again later" in copy["body"].lower()
+    assert copy["action_label"] == "Try again"
+    assert copy["ai_required"] is True
+    assert copy["tone"] == "urgent"
+    assert "GEMINI_API_KEY" in copy["hint"]
+    assert "sk-" not in copy["hint"].lower()
+    assert copy["email"] == "SITCounselling@SingaporeTech.edu.sg"
+    assert copy["helpline"] == "6592 2030"
+    assert copy["mailto"] == "mailto:SITCounselling@SingaporeTech.edu.sg"
+    assert copy["contacts"] == {
+        "email": "SITCounselling@SingaporeTech.edu.sg",
+        "helpline": "6592 2030",
+        "mailto": "mailto:SITCounselling@SingaporeTech.edu.sg",
+    }
+    panel = copy["speak_to_advisor"]
+    assert panel == io.format_speak_to_advisor_panel("high")
+    assert panel["prominence"] == "high"
+    assert "soft_label" not in copy
+    assert "tips" not in copy
+    assert "label" not in copy
+
+
+def _assert_only_official_contacts(copy):
+    emails = []
+    phones = []
+    for text in _walk_strings(copy):
+        if "@" in text:
+            emails.append(text)
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) >= 8:
+            phones.append(text)
+    for value in emails:
+        assert value in OFFICIAL_CONTACTS, f"invented email: {value}"
+    for value in phones:
+        assert value in OFFICIAL_CONTACTS, f"invented phone: {value}"
+
+
+def test_format_ai_unavailable_error_dict_shape():
+    copy = io.format_ai_unavailable_error()
+    _assert_ai_error_shape(copy)
+    assert copy["error_code"] == "unavailable"
+    assert copy["reason"] is None
+    assert copy["error"] is None
+
+
+def test_format_ai_unavailable_error_includes_official_contacts_only():
+    copy = io.format_ai_unavailable_error()
+    _assert_only_official_contacts(copy)
+    assert "gmail.com" not in str(copy).lower()
+    assert "hotmail" not in str(copy).lower()
+    assert "counsellor@" not in str(copy).lower()
+    assert "999" not in str(copy)
+    assert "1800" not in str(copy)
+
+
+def test_format_ai_unavailable_error_keeps_safe_reason_out_of_student_copy():
+    copy = io.format_ai_unavailable_error("Gemini timed out after 3 attempts")
+    _assert_ai_error_shape(copy)
+    assert copy["reason"] == "Gemini timed out after 3 attempts"
+    assert "timed out after 3 attempts" not in copy["body"]
+    assert "timed out after 3 attempts" in copy["hint"]
+    _assert_only_official_contacts(copy)
+
+
+def test_format_ai_unavailable_error_drops_secret_looking_reason():
+    fake_key = "AIzaSyDummyGeminiKeyValueThatLooksReal123"
+    copy = io.format_ai_unavailable_error(fake_key)
+    _assert_ai_error_shape(copy)
+    assert copy["reason"] is None
+    assert fake_key not in copy["hint"]
+    assert fake_key not in copy["body"]
+    assert fake_key not in copy["message"]
+    _assert_only_official_contacts(copy)
+
+
+def test_format_ai_error_maps_known_codes():
+    for code in io.AI_ERROR_CODES:
+        copy = io.format_ai_error(code)
+        _assert_ai_error_shape(copy)
+        _assert_only_official_contacts(copy)
+        assert copy["error_code"] == code
+        assert copy["error"] is None
+        assert copy["hint"] == io.AI_ERROR_HINTS[code]
+        assert "GEMINI_API_KEY" in copy["hint"]
+
+
+def test_format_ai_error_missing_api_key_hint_does_not_expose_secret():
+    copy = io.format_ai_error("missing_api_key", detail="GEMINI_API_KEY=should-not-leak")
+    _assert_ai_error_shape(copy)
+    assert copy["error_code"] == "missing_api_key"
+    assert copy["reason"] is None
+    assert "should-not-leak" not in copy["hint"]
+    assert "should-not-leak" not in copy["body"]
+    assert "GEMINI_API_KEY" in copy["hint"]
+    _assert_only_official_contacts(copy)
+
+
+def test_format_ai_error_unknown_code_still_has_contacts():
+    copy = io.format_ai_error("not-a-real-code")
+    _assert_ai_error_shape(copy)
+    _assert_only_official_contacts(copy)
+    assert copy["error_code"] == "unavailable"
+    assert copy["error"]
+    assert "missing_api_key" in copy["error"]
+    assert copy["speak_to_advisor"]["email"] == "SITCounselling@SingaporeTech.edu.sg"
+
+
+def test_format_ai_error_does_not_print():
+    with patch("builtins.print", side_effect=AssertionError("formatter used print()")):
+        io.format_ai_unavailable_error()
+        io.format_ai_error("timeout")
+        io.format_ai_error("invalid_response", detail="schema mismatch")
+        io.format_ai_error("retries_exhausted")
+
+
+# ---------------------------------------------------------------------------
 # format_student_record
 # ---------------------------------------------------------------------------
 
