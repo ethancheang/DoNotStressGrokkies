@@ -184,20 +184,25 @@ def test_each_missing_ai_field_is_rejected(field):
 
 
 def test_unusable_ai_types_are_rejected():
-    result = lm.apply_logic(_enriched(risk_score="hot"))
-    _assert_error_no_invented_outcome(result)
+    bad_score = _enriched(risk_score="hot")
+    result = lm.apply_logic(bad_score)
+    _assert_error_no_invented_outcome(result, bad_score)
+    assert result["ok"] is False
     assert "risk_score" in result["invalid"]
 
-    result = lm.apply_logic(_enriched(tips="sleep_routine"))
-    _assert_error_no_invented_outcome(result)
+    bad_tips = _enriched(tips="sleep_routine")
+    result = lm.apply_logic(bad_tips)
+    _assert_error_no_invented_outcome(result, bad_tips)
     assert "tips" in result["invalid"]
 
-    result = lm.apply_logic(_enriched(reasoning=""))
-    _assert_error_no_invented_outcome(result)
+    bad_reasoning = _enriched(reasoning="")
+    result = lm.apply_logic(bad_reasoning)
+    _assert_error_no_invented_outcome(result, bad_reasoning)
     assert "reasoning" in result["invalid"]
 
-    result = lm.apply_logic(_enriched(primary_stressors="sleep_deprivation"))
-    _assert_error_no_invented_outcome(result)
+    bad_stressors = _enriched(primary_stressors="sleep_deprivation")
+    result = lm.apply_logic(bad_stressors)
+    _assert_error_no_invented_outcome(result, bad_stressors)
     assert "primary_stressors" in result["invalid"]
 
 
