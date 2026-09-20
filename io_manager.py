@@ -1,13 +1,80 @@
-"""I/O Manager for DoNotStress — Student Academic & Wellbeing Risk CLI.
+"""I/O Manager for DoNotStress — student-facing Flask input layer.
 
-This is the only application module allowed to call print() or input().
-Validators are pure: validate_X(raw) -> (ok, value_or_error) and never
-touch stdin/stdout, so they can be unit-tested in isolation.
+Audience is students via a local Flask web UI (not advisors). This module
+owns pure-function validators and template formatters only.
 
-Other layers (ai_manager, logic_manager, data_manager, main) should call
-the getters, collect_student_record(), formatters, and print_* helpers
-here instead of talking to the console themselves.
+Joe's Flask app should import FORM_FIELDS / validate_student_form /
+format_* helpers. Do not put Gemini, Intervention Tier rules, or file I/O
+here. Functions only — no object types defined in this module.
+
+Canonical Flask form field names (request.form keys) — use FORM_FIELDS:
+  student_id          required  str   2-digit year in {23,24,25,26} + 5 digits
+  sleep_hours         required  float 0.0–24.0 inclusive, 0.5-hour steps
+  stress_level        required  int   1–10 inclusive
+  academic_workload   required  int   1–10 inclusive
+  financial_stress    required  int   1–10 inclusive (scale, not yes/no)
+  social_support      required  int   1–10 inclusive
+  feelings_text       optional  str   blank allowed
+                                      prompt: "In your own words, how have you
+                                      been feeling about school lately?"
+
+Removed from this public API (do not collect):
+  submission_rate, cca_count, consecutive_absences, free_text_concern,
+  and the old financial_stress yes/no bool.
+
+Validators are pure: validate_X(raw) -> (ok, value_or_error_message).
+Web entry point: validate_student_form(form_dict) -> (ok, record_or_errors).
+A thin CLI collect_student_record() remains for smoke tests only.
 """
+
+# ---------------------------------------------------------------------------
+# Form field names for Flask coordination
+# ---------------------------------------------------------------------------
+
+FORM_FIELDS = {
+    "student_id": "student_id",
+    "sleep_hours": "sleep_hours",
+    "stress_level": "stress_level",
+    "academic_workload": "academic_workload",
+    "financial_stress": "financial_stress",
+    "social_support": "social_support",
+    "feelings_text": "feelings_text",
+}
+
+FORM_PROMPTS = {
+    "student_id": "Student ID",
+    "sleep_hours": "How many hours of sleep did you get last night?",
+    "stress_level": "How stressed have you been feeling? (1–10)",
+    "academic_workload": "How heavy has your academic workload felt? (1–10)",
+    "financial_stress": "How stressed have you been about money? (1–10)",
+    "social_support": "How supported have you felt by people around you? (1–10)",
+    "feelings_text": (
+        "In your own words, how have you been feeling about school lately?"
+    ),
+}
+
+RECORD_FIELD_ORDER = (
+    "student_id",
+    "sleep_hours",
+    "stress_level",
+    "academic_workload",
+    "financial_stress",
+    "social_support",
+    "feelings_text",
+)
+
+REQUIRED_FORM_FIELDS = (
+    "student_id",
+    "sleep_hours",
+    "stress_level",
+    "academic_workload",
+    "financial_stress",
+    "social_support",
+)
+
+# ---------------------------------------------------------------------------
+# Validation constants
+# ---------------------------------------------------------------------------
 
 VALID_STUDENT_ID_YEARS = ("23", "24", "25", "26")
 STUDENT_ID_EXAMPLE = "2605581"
@@ -15,53 +82,122 @@ STUDENT_ID_SERIAL_DIGITS = 5
 
 SLEEP_HOURS_MIN = 0.0
 SLEEP_HOURS_MAX = 24.0
-STRESS_LEVEL_MIN = 1
-STRESS_LEVEL_MAX = 10
-SUBMISSION_RATE_MIN = 0.0
-SUBMISSION_RATE_MAX = 100.0
+SLEEP_HOURS_STEP = 0.5
 
-RECORD_FIELD_ORDER = (
-    "student_id",
-    "sleep_hours",
-    "stress_level",
-    "submission_rate",
-    "cca_count",
-    "financial_stress",
-    "consecutive_absences",
-    "free_text_concern",
+SCALE_MIN = 1
+SCALE_MAX = 10
+
+# ---------------------------------------------------------------------------
+# Soft labels, tips allow-list, advisor contacts (hardcoded — never invent)
+# ---------------------------------------------------------------------------
+
+SOFT_LABELS = (
+    "You're doing ok",
+    "Worth a check-in",
+    "Please reach out",
 )
 
-RECORD_LABELS = {
-    "student_id": "Student ID",
-    "sleep_hours": "Sleep Hours",
-    "stress_level": "Stress Level",
-    "submission_rate": "Submission Rate",
-    "cca_count": "CCA Count",
-    "financial_stress": "Financial Stress",
-    "consecutive_absences": "Consecutive Absences",
-    "free_text_concern": "Free-text Concern",
+SOFT_LABEL_COPY = {
+    "You're doing ok": {
+        "label": "You're doing ok",
+        "heading": "You're doing ok",
+        "body": "Your check-in looks steady. Keep looking after yourself.",
+        "tone": "reassuring",
+    },
+    "Worth a check-in": {
+        "label": "Worth a check-in",
+        "heading": "Worth a check-in",
+        "body": (
+            "Some things look a bit heavier right now. "
+            "A conversation could help."
+        ),
+        "tone": "supportive",
+    },
+    "Please reach out": {
+        "label": "Please reach out",
+        "heading": "Please reach out",
+        "body": (
+            "Please reach out for support. "
+            "You do not have to handle this on your own."
+        ),
+        "tone": "urgent",
+    },
 }
 
-SUMMARY_LABELS = {
-    "total_students": "Total Students",
-    "average_sleep_hours": "Average Sleep Hours",
-    "average_stress_level": "Average Stress Level",
-    "average_submission_rate": "Average Submission Rate",
-    "average_cca_count": "Average CCA Count",
-    "financial_stress_count": "Students with Financial Stress",
-    "average_consecutive_absences": "Average Consecutive Absences",
-    "high_risk_count": "High Risk Count",
-    "medium_risk_count": "Medium Risk Count",
-    "low_risk_count": "Low Risk Count",
+# Tip IDs that templates / other layers may pass into format_tips.
+# Copy is student-facing. Do not add phone numbers or extra emails here.
+TIPS_ALLOWLIST = {
+    "sleep_routine": (
+        "Try to keep a regular sleep schedule, including on weekends."
+    ),
+    "rest_a_little_more": (
+        "If you can, give yourself a bit more rest — even 30 extra minutes "
+        "can help."
+    ),
+    "short_breaks": (
+        "Take short, planned breaks between study blocks instead of pushing "
+        "through without a pause."
+    ),
+    "workload_chunks": (
+        "Break larger assignments into smaller tasks and spread them across "
+        "the week."
+    ),
+    "money_worries": (
+        "If money is on your mind, campus support can help you find the "
+        "right next step."
+    ),
+    "talk_to_someone": (
+        "Reach out to a friend, classmate, or family member — you do not "
+        "have to handle this alone."
+    ),
+    "keep_social_contact": (
+        "Stay in touch with people who help you feel supported, even with "
+        "a short check-in."
+    ),
+    "feelings_check_in": (
+        "Name how you have been feeling and give yourself permission to "
+        "ask for help if school feels heavy."
+    ),
 }
 
-PERCENT_KEYS = {
-    "submission_rate",
-    "average_submission_rate",
+SPEAK_PROMINENCE = ("low", "medium", "high")
+
+# Real contacts only. Model / callers must never invent others.
+ADVISOR_EMAIL = "SITCounselling@SingaporeTech.edu.sg"
+ADVISOR_HELPLINE = "6592 2030"
+ADVISOR_MAILTO = "mailto:SITCounselling@SingaporeTech.edu.sg"
+
+ADVISOR_CONTACTS = {
+    "email": ADVISOR_EMAIL,
+    "helpline": ADVISOR_HELPLINE,
+    "mailto": ADVISOR_MAILTO,
 }
 
-_YES_VALUES = {"yes"}
-_NO_VALUES = {"no"}
+SPEAK_PANEL_COPY = {
+    "low": {
+        "heading": "Support is available",
+        "body": (
+            "If you would like to talk, you can contact SIT Counselling."
+        ),
+        "cta": "Optional: get in touch",
+    },
+    "medium": {
+        "heading": "Consider speaking with someone",
+        "body": (
+            "It may help to talk with SIT Counselling about how you have "
+            "been feeling."
+        ),
+        "cta": "Reach out when you are ready",
+    },
+    "high": {
+        "heading": "Please reach out",
+        "body": (
+            "Please contact SIT Counselling. You do not have to handle "
+            "this on your own."
+        ),
+        "cta": "Contact support now",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -109,54 +245,53 @@ def _parse_float(raw) -> tuple[bool, float | str]:
     return True, value
 
 
-def _humanize_key(key: str) -> str:
-    return str(key).replace("_", " ").title()
+def _is_half_hour_step(value: float) -> bool:
+    """True when value is a multiple of 0.5 (within a tiny float tolerance)."""
+    steps = value / SLEEP_HOURS_STEP
+    return abs(steps - round(steps)) <= 1e-9
 
 
-def _format_bool(value: bool) -> str:
-    return "Yes" if value else "No"
+def _quantize_half_hour(value: float) -> float:
+    return round(value / SLEEP_HOURS_STEP) * SLEEP_HOURS_STEP
 
 
-def _format_field_value(key: str, value) -> str:
-    if value is None:
-        return "(none)"
-    if key == "free_text_concern":
-        text = str(value).strip()
-        return text if text else "(none)"
-    if key == "financial_stress" or type(value) is bool:
-        return _format_bool(bool(value))
-    if key in PERCENT_KEYS:
-        return f"{float(value):.1f}%"
-    if key in {"sleep_hours", "average_sleep_hours", "average_submission_rate"}:
-        return f"{float(value):.1f}"
-    if type(value) is float:
-        return f"{value:.1f}"
-    return str(value)
-
-
-def _format_summary_value(key: str, value) -> str:
-    if type(value) is bool:
-        return _format_bool(value)
-    if type(value) is list or type(value) is tuple:
-        if len(value) == 0:
-            return "(none)"
-        return ", ".join(str(item) for item in value)
-    if type(value) is dict:
-        if len(value) == 0:
-            return "(none)"
-        inner = "; ".join(
-            f"{_humanize_key(inner_key)}={_format_summary_value(inner_key, inner_value)}"
-            for inner_key, inner_value in value.items()
+def _validate_scale_1_to_10(raw, field_label: str) -> tuple[bool, int | str]:
+    ok, parsed = _parse_int(raw)
+    if not ok:
+        return False, f"{field_label} {parsed}."
+    if parsed < SCALE_MIN or parsed > SCALE_MAX:
+        return False, (
+            f"{field_label} must be an integer between {SCALE_MIN} and "
+            f"{SCALE_MAX} (inclusive)."
         )
-        return inner
-    if key in PERCENT_KEYS:
-        try:
-            return f"{float(value):.1f}%"
-        except (TypeError, ValueError):
-            return str(value)
-    if type(value) is float:
-        return f"{value:.1f}"
-    return str(value)
+    return True, parsed
+
+
+def _form_get(form_dict, key: str):
+    """Read one key from a Flask request.form-like mapping."""
+    if form_dict is None:
+        return ""
+    getter = getattr(form_dict, "get", None)
+    if getter is None:
+        return ""
+    value = getter(key)
+    if value is None:
+        return ""
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Normalize helpers (Flask request.form strings)
+# ---------------------------------------------------------------------------
+
+def normalize_form_value(raw) -> str:
+    """Strip a single form value. None becomes ''."""
+    return _as_text(raw)
+
+
+def extract_form_fields(form_dict) -> dict:
+    """Return only the canonical FORM_FIELDS keys from a form mapping."""
+    return {key: normalize_form_value(_form_get(form_dict, key)) for key in FORM_FIELDS}
 
 
 # ---------------------------------------------------------------------------
@@ -184,82 +319,237 @@ def validate_student_id(raw) -> tuple[bool, str]:
 
 
 def validate_sleep_hours(raw) -> tuple[bool, float | str]:
-    """Require a float in [0.0, 24.0]."""
+    """Require a float in [0.0, 24.0] on 0.5-hour steps (5.0, 5.5, 6.0)."""
     ok, parsed = _parse_float(raw)
     if not ok:
         return False, f"Sleep hours {parsed}."
     if parsed < SLEEP_HOURS_MIN or parsed > SLEEP_HOURS_MAX:
         return False, (
             f"Sleep hours must be between {SLEEP_HOURS_MIN:.1f} and "
-            f"{SLEEP_HOURS_MAX:.1f} (inclusive)."
+            f"{SLEEP_HOURS_MAX:.1f} (inclusive), in {SLEEP_HOURS_STEP}-hour "
+            "steps (e.g. 5.0, 5.5, 6.0)."
         )
-    return True, parsed
+    if not _is_half_hour_step(parsed):
+        return False, (
+            "Sleep hours must be in 0.5-hour steps "
+            "(e.g. 5.0, 5.5, 6.0). Values like 5.25 are not allowed."
+        )
+    return True, _quantize_half_hour(parsed)
 
 
 def validate_stress_level(raw) -> tuple[bool, int | str]:
     """Require an integer in [1, 10]."""
-    ok, parsed = _parse_int(raw)
-    if not ok:
-        return False, f"Stress level {parsed}."
-    if parsed < STRESS_LEVEL_MIN or parsed > STRESS_LEVEL_MAX:
-        return False, (
-            f"Stress level must be an integer between {STRESS_LEVEL_MIN} and "
-            f"{STRESS_LEVEL_MAX} (inclusive)."
-        )
-    return True, parsed
+    return _validate_scale_1_to_10(raw, "Stress level")
 
 
-def validate_submission_rate(raw) -> tuple[bool, float | str]:
-    """Require a float in [0.0, 100.0]."""
-    ok, parsed = _parse_float(raw)
-    if not ok:
-        return False, f"Submission rate {parsed}."
-    if parsed < SUBMISSION_RATE_MIN or parsed > SUBMISSION_RATE_MAX:
-        return False, (
-            f"Submission rate must be between {SUBMISSION_RATE_MIN:.1f} and "
-            f"{SUBMISSION_RATE_MAX:.1f} (inclusive)."
-        )
-    return True, parsed
+def validate_academic_workload(raw) -> tuple[bool, int | str]:
+    """Require an integer in [1, 10]."""
+    return _validate_scale_1_to_10(raw, "Academic workload")
 
 
-def validate_cca_count(raw) -> tuple[bool, int | str]:
-    """Require an integer >= 0."""
-    ok, parsed = _parse_int(raw)
-    if not ok:
-        return False, f"CCA count {parsed}."
-    if parsed < 0:
-        return False, "CCA count must be an integer greater than or equal to 0."
-    return True, parsed
+def validate_financial_stress(raw) -> tuple[bool, int | str]:
+    """Require an integer in [1, 10] (scale, not yes/no)."""
+    return _validate_scale_1_to_10(raw, "Financial stress")
 
 
-def validate_financial_stress(raw) -> tuple[bool, bool | str]:
-    """Require yes/no only (case-insensitive). Returns a bool on success."""
-    text = _as_text(raw).lower()
-    if text in _YES_VALUES:
-        return True, True
-    if text in _NO_VALUES:
-        return True, False
-    return False, "Financial stress must be 'yes' or 'no' (not y/n or true/false)."
+def validate_social_support(raw) -> tuple[bool, int | str]:
+    """Require an integer in [1, 10]."""
+    return _validate_scale_1_to_10(raw, "Social support")
 
 
-def validate_consecutive_absences(raw) -> tuple[bool, int | str]:
-    """Require an integer >= 0."""
-    ok, parsed = _parse_int(raw)
-    if not ok:
-        return False, f"Consecutive absences {parsed}."
-    if parsed < 0:
-        return False, "Consecutive absences must be an integer greater than or equal to 0."
-    return True, parsed
-
-
-def validate_free_text_concern(raw) -> tuple[bool, str]:
+def validate_feelings_text(raw) -> tuple[bool, str]:
     """Optional free text. Blank or whitespace-only is stored as ''."""
     return True, _as_text(raw)
 
 
+_FIELD_VALIDATORS = {
+    "student_id": validate_student_id,
+    "sleep_hours": validate_sleep_hours,
+    "stress_level": validate_stress_level,
+    "academic_workload": validate_academic_workload,
+    "financial_stress": validate_financial_stress,
+    "social_support": validate_social_support,
+    "feelings_text": validate_feelings_text,
+}
+
+
+def validate_student_form(form_dict) -> tuple[bool, dict]:
+    """Validate every student field from a Flask request.form-like mapping.
+
+    Returns (True, record) when all fields are valid.
+    Returns (False, errors) when any required field fails. `errors` maps
+    field name -> error message. All fields are checked (not fail-fast).
+
+    `form_dict` may be a dict, Flask ImmutableMultiDict, or any object
+    with .get(key). Missing keys are treated as blank strings.
+    """
+    record = {}
+    errors = {}
+    for key in RECORD_FIELD_ORDER:
+        raw = _form_get(form_dict, key)
+        ok, result = _FIELD_VALIDATORS[key](raw)
+        if ok:
+            record[key] = result
+        else:
+            errors[key] = result
+    if errors:
+        return False, errors
+    return True, record
+
+
+def collect_student_record_from_form(form_dict) -> tuple[bool, dict]:
+    """Alias of validate_student_form for Flask call sites."""
+    return validate_student_form(form_dict)
+
+
 # ---------------------------------------------------------------------------
-# Interactive getters — re-prompt until a validator accepts the value
+# Formatters for web templates — strings / plain dicts of copy; no print
 # ---------------------------------------------------------------------------
+
+def format_soft_label(soft_label) -> dict:
+    """Return template copy for a soft label.
+
+    soft_label must be one of SOFT_LABELS:
+      "You're doing ok" | "Worth a check-in" | "Please reach out"
+    """
+    text = _as_text(soft_label)
+    copy = SOFT_LABEL_COPY.get(text)
+    if copy is None:
+        allowed = ", ".join(f'"{label}"' for label in SOFT_LABELS)
+        return {
+            "label": "",
+            "heading": "",
+            "body": "",
+            "tone": "",
+            "error": f"Unknown soft label. Use one of: {allowed}.",
+        }
+    return {
+        "label": copy["label"],
+        "heading": copy["heading"],
+        "body": copy["body"],
+        "tone": copy["tone"],
+        "error": None,
+    }
+
+
+def format_tips(tips) -> dict:
+    """Return template copy for an allow-listed tip list.
+
+    `tips` is a list of tip IDs (preferred) or exact allow-list strings.
+    Unknown tips are dropped — this formatter never invents copy.
+    Duplicates keep the first occurrence only.
+    """
+    items = []
+    seen = set()
+    if tips is None:
+        tips = []
+    for raw in tips:
+        text = _as_text(raw)
+        if not text or text in seen:
+            continue
+        tip_id = None
+        tip_text = None
+        if text in TIPS_ALLOWLIST:
+            tip_id = text
+            tip_text = TIPS_ALLOWLIST[text]
+        else:
+            for known_id, known_text in TIPS_ALLOWLIST.items():
+                if text == known_text:
+                    tip_id = known_id
+                    tip_text = known_text
+                    break
+        if tip_id is None:
+            continue
+        seen.add(tip_id)
+        seen.add(tip_text)
+        items.append({"id": tip_id, "text": tip_text})
+    return {
+        "heading": "Suggestions for you",
+        "items": items,
+        "texts": [item["text"] for item in items],
+    }
+
+
+def format_speak_to_advisor_panel(speak_prominence) -> dict:
+    """Return the Speak-to-Advisor panel copy and hardcoded contacts.
+
+    speak_prominence is "low" | "medium" | "high" and changes tone only.
+    Contacts are always the same real values — never invented:
+      email    SITCounselling@SingaporeTech.edu.sg
+      helpline 6592 2030
+      mailto   mailto:SITCounselling@SingaporeTech.edu.sg
+
+    Unknown prominence still includes those contacts and uses medium copy.
+    """
+    prominence = _as_text(speak_prominence).lower()
+    copy = SPEAK_PANEL_COPY.get(prominence)
+    error = None
+    if copy is None:
+        prominence = "medium"
+        copy = SPEAK_PANEL_COPY["medium"]
+        allowed = ", ".join(SPEAK_PROMINENCE)
+        error = f"Unknown speak_prominence. Use one of: {allowed}."
+    return {
+        "prominence": prominence,
+        "heading": copy["heading"],
+        "body": copy["body"],
+        "cta": copy["cta"],
+        "email": ADVISOR_EMAIL,
+        "helpline": ADVISOR_HELPLINE,
+        "mailto": ADVISOR_MAILTO,
+        "contacts": {
+            "email": ADVISOR_EMAIL,
+            "helpline": ADVISOR_HELPLINE,
+            "mailto": ADVISOR_MAILTO,
+        },
+        "error": error,
+    }
+
+
+def format_student_record(record: dict) -> dict:
+    """Return a plain dict of labelled values for a confirmation template."""
+    if not record:
+        return {
+            "heading": "Your check-in",
+            "fields": [],
+            "empty": True,
+        }
+    fields = []
+    for key in RECORD_FIELD_ORDER:
+        if key not in record:
+            continue
+        value = record[key]
+        if key == "feelings_text":
+            display = str(value).strip() if value is not None else ""
+            if not display:
+                display = "(skipped)"
+        elif key == "sleep_hours":
+            display = f"{float(value):.1f}"
+        else:
+            display = str(value)
+        fields.append({
+            "key": key,
+            "label": FORM_PROMPTS[key],
+            "value": display,
+        })
+    return {
+        "heading": "Your check-in",
+        "fields": fields,
+        "empty": len(fields) == 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Thin CLI helper — smoke tests only; field names match the web form
+# ---------------------------------------------------------------------------
+
+def print_message(message: str) -> None:
+    print(message)
+
+
+def print_error(message: str) -> None:
+    print(f"Error: {message}")
+
 
 def _prompt_until_valid(prompt: str, validator):
     """Read a line, validate, and re-prompt with the error until valid."""
@@ -280,7 +570,7 @@ def get_student_id() -> str:
 
 def get_sleep_hours() -> float:
     return _prompt_until_valid(
-        "Sleep hours last night (0.0 to 24.0): ",
+        "Sleep hours last night (0.0 to 24.0, in 0.5 steps): ",
         validate_sleep_hours,
     )
 
@@ -292,163 +582,51 @@ def get_stress_level() -> int:
     )
 
 
-def get_submission_rate() -> float:
+def get_academic_workload() -> int:
     return _prompt_until_valid(
-        "Assignment submission rate (0.0 to 100.0): ",
-        validate_submission_rate,
+        "Academic workload (1 to 10): ",
+        validate_academic_workload,
     )
 
 
-def get_cca_count() -> int:
+def get_financial_stress() -> int:
     return _prompt_until_valid(
-        "Number of CCAs (0 or more): ",
-        validate_cca_count,
-    )
-
-
-def get_financial_stress() -> bool:
-    return _prompt_until_valid(
-        "Financial stress? (yes/no): ",
+        "Financial stress (1 to 10): ",
         validate_financial_stress,
     )
 
 
-def get_consecutive_absences() -> int:
+def get_social_support() -> int:
     return _prompt_until_valid(
-        "Consecutive absences (0 or more): ",
-        validate_consecutive_absences,
+        "Social support (1 to 10): ",
+        validate_social_support,
     )
 
 
-def get_free_text_concern() -> str:
+def get_feelings_text() -> str:
     return _prompt_until_valid(
-        "Free-text concern (optional, press Enter to skip): ",
-        validate_free_text_concern,
+        "In your own words, how have you been feeling about school lately? "
+        "(optional, press Enter to skip): ",
+        validate_feelings_text,
     )
 
 
 def collect_student_record() -> dict:
-    """Prompt for every student field and return a snake_case record dict."""
-    print_message("Enter student academic and wellbeing details.")
+    """Prompt for every web-aligned field (CLI smoke test only)."""
+    print_message("Student wellbeing check-in.")
     print_message("Invalid values will be rejected until a valid value is entered.")
     return {
         "student_id": get_student_id(),
         "sleep_hours": get_sleep_hours(),
         "stress_level": get_stress_level(),
-        "submission_rate": get_submission_rate(),
-        "cca_count": get_cca_count(),
+        "academic_workload": get_academic_workload(),
         "financial_stress": get_financial_stress(),
-        "consecutive_absences": get_consecutive_absences(),
-        "free_text_concern": get_free_text_concern(),
+        "social_support": get_social_support(),
+        "feelings_text": get_feelings_text(),
     }
 
 
-# ---------------------------------------------------------------------------
-# Formatters — return strings; no print()
-# ---------------------------------------------------------------------------
-
-def format_student_record(record: dict) -> str:
-    """Render one student record as a labelled block."""
-    if not record:
-        return "Student Record\n--------------\nNo student data to display."
-
-    label_width = max(len(label) for label in RECORD_LABELS.values())
-    lines = ["Student Record", "-" * len("Student Record")]
-    for key in RECORD_FIELD_ORDER:
-        if key not in record:
-            continue
-        label = RECORD_LABELS[key]
-        value = _format_field_value(key, record[key])
-        lines.append(f"{label + ':':<{label_width + 1}} {value}")
-    return "\n".join(lines)
-
-
-def format_cohort_list(records) -> str:
-    """Render a list of student records as a numbered cohort listing."""
-    if records is None:
-        records = []
-    count = len(records)
-    heading = f"Cohort List ({count} student{'s' if count != 1 else ''})"
-    lines = [heading, "=" * len(heading)]
-    if count == 0:
-        lines.append("No student records to display.")
-        return "\n".join(lines)
-
-    for index, record in enumerate(records, start=1):
-        record = record or {}
-        student_id = record.get("student_id", "(unknown)")
-        sleep = _format_field_value("sleep_hours", record.get("sleep_hours", 0.0))
-        stress = record.get("stress_level", "?")
-        submit = _format_field_value("submission_rate", record.get("submission_rate", 0.0))
-        cca = record.get("cca_count", "?")
-        financial = _format_field_value("financial_stress", record.get("financial_stress", False))
-        absences = record.get("consecutive_absences", "?")
-        concern = _format_field_value("free_text_concern", record.get("free_text_concern", ""))
-        lines.append(
-            f"{index}. {student_id} | sleep {sleep}h | stress {stress}/10 | "
-            f"submit {submit} | cca {cca} | financial {financial} | absences {absences}"
-        )
-        lines.append(f"   Concern: {concern}")
-    return "\n".join(lines)
-
-
-def format_summary_view(summary: dict) -> str:
-    """Render a cohort summary dict produced by another layer.
-
-    Known keys get friendly labels; any extra snake_case keys are humanized.
-    Nested dicts and lists are formatted inline so logic_manager can pass
-    extra aggregates without this module knowing the scoring rules.
-    """
-    heading = "Cohort Summary"
-    lines = [heading, "=" * len(heading)]
-    if not summary:
-        lines.append("No summary data to display.")
-        return "\n".join(lines)
-
-    rendered_keys = set()
-    rows = []
-
-    for key in SUMMARY_LABELS:
-        if key in summary:
-            rows.append((SUMMARY_LABELS[key], _format_summary_value(key, summary[key])))
-            rendered_keys.add(key)
-
-    for key, value in summary.items():
-        if key in rendered_keys:
-            continue
-        rows.append((_humanize_key(key), _format_summary_value(key, value)))
-
-    label_width = max(len(label) for label, _ in rows)
-    for label, value in rows:
-        lines.append(f"{label + ':':<{label_width + 1}} {value}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# print_* helpers — the only console output API other layers should use
-# ---------------------------------------------------------------------------
-
-def print_message(message: str) -> None:
-    print(message)
-
-
-def print_error(message: str) -> None:
-    print(f"Error: {message}")
-
-
-def print_student_record(record: dict) -> None:
-    print(format_student_record(record))
-
-
-def print_cohort_list(records) -> None:
-    print(format_cohort_list(records))
-
-
-def print_summary_view(summary: dict) -> None:
-    print(format_summary_view(summary))
-
-
 if __name__ == "__main__":
-    demo_record = collect_student_record()
+    demo = collect_student_record()
     print_message("")
-    print_student_record(demo_record)
+    print_message(str(format_student_record(demo)))
