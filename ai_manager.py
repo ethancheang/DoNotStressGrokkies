@@ -5,14 +5,16 @@ Sole owner of Gemini prompt construction, structured JSON API calls,
 schema validation, and graceful retries.
 
 Audience: students (local Flask web UI), not advisors.
-Gemini is PRIMARY: it chooses soft_label / tips / speak_prominence
-when available. Business-rule fallback lives in logic_manager — not here.
+Gemini is MANDATORY: every record must pass through analyse_student /
+call_gemini. This layer never invents soft_label / tips / speak_prominence
+as a substitute product, and never falls back to logic_manager.
 
 Pure procedural Python: functions only.
 No terminal I/O (print / input), no Intervention Tier rules, no file persistence.
 
 Pipeline position:
-  User → io_manager → ai_manager → logic_manager → data_manager
+  User → io_manager → ai_manager (required) → data_manager
+  On failure: structured error for io_manager.format_ai_error (no Logic substitute)
 """
 
 from __future__ import annotations
@@ -109,6 +111,146 @@ _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_RETRY_DELAY_SEC = 0.5
 _TIPS_MIN = 1
 _TIPS_MAX = 3
+
+# ---------------------------------------------------------------------------
+# Structured AI failures — codes MUST match io_manager.format_ai_error
+# ---------------------------------------------------------------------------
+
+AI_SOURCE = "gemini"
+
+ERROR_CODE_MISSING_API_KEY = "missing_api_key"
+ERROR_CODE_TIMEOUT = "timeout"
+ERROR_CODE_INVALID_RESPONSE = "invalid_response"
+ERROR_CODE_RETRIES_EXHAUSTED = "retries_exhausted"
+ERROR_CODE_UNAVAILABLE = "unavailable"
+
+AI_ERROR_CODES = (
+    ERROR_CODE_MISSING_API_KEY,
+    ERROR_CODE_TIMEOUT,
+    ERROR_CODE_INVALID_RESPONSE,
+    ERROR_CODE_RETRIES_EXHAUSTED,
+    ERROR_CODE_UNAVAILABLE,
+)
+
+_TIMEOUT_MARKERS = (
+    "timeout",
+    "timed out",
+    "timed_out",
+    "deadlineexceeded",
+    "deadline exceeded",
+    "read timed out",
+)
+_SCHEMA_MARKERS = (
+    "schema validation",
+    "not valid json",
+    "jsondecodeerror",
+    "jsondecode",
+    "malformed",
+    "missing required fields",
+    "must be a json object",
+    "empty ai response",
+    "allow-list",
+    "invalid json",
+    "ai response must be",
+)
+_MISSING_KEY_MARKERS = (
+    "missing_api_key",
+    "gemini_api_key is not set",
+    "api key is not set",
+    "api_key is not set",
+)
+
+
+def classify_ai_error(exc_or_message: Any) -> str:
+    """
+    Map an exception or message to one of AI_ERROR_CODES.
+
+    Used by call_gemini and by Flask/I/O to pick format_ai_error copy.
+    Unknown inputs map to "unavailable" (never invent a product outcome).
+    """
+    if isinstance(exc_or_message, dict):
+        code = str(exc_or_message.get("error_code", "")).strip().lower()
+        if code in AI_ERROR_CODES:
+            return code
+        exc_or_message = exc_or_message.get("detail", "")
+
+    type_name = ""
+    if isinstance(exc_or_message, BaseException):
+        type_name = type(exc_or_message).__name__
+        text = str(exc_or_message)
+    elif exc_or_message is None:
+        text = ""
+    else:
+        text = str(exc_or_message)
+
+    combined = f"{type_name} {text}".strip().lower()
+    if not combined:
+        return ERROR_CODE_UNAVAILABLE
+
+    if any(marker in combined for marker in _MISSING_KEY_MARKERS):
+        return ERROR_CODE_MISSING_API_KEY
+    if "gemini_api_key" in combined and (
+        "not set" in combined or "missing" in combined or "blank" in combined
+    ):
+        return ERROR_CODE_MISSING_API_KEY
+
+    if any(marker in combined for marker in _TIMEOUT_MARKERS):
+        return ERROR_CODE_TIMEOUT
+
+    if any(marker in combined for marker in _SCHEMA_MARKERS):
+        return ERROR_CODE_INVALID_RESPONSE
+
+    if "retries_exhausted" in combined or (
+        "retries" in combined and "exhaust" in combined
+    ):
+        return ERROR_CODE_RETRIES_EXHAUSTED
+
+    return ERROR_CODE_UNAVAILABLE
+
+
+def _structured_ai_error(error_code: str, detail: str) -> dict[str, str]:
+    """Build the failure dict Flask can pass to io_manager.format_ai_error."""
+    code = error_code if error_code in AI_ERROR_CODES else ERROR_CODE_UNAVAILABLE
+    return {
+        "error_code": code,
+        "detail": str(detail),
+        "source": AI_SOURCE,
+    }
+
+
+def _final_ai_error(
+    last_kind: str,
+    last_detail: str,
+    *,
+    attempts: int,
+    last_was_api_exception: bool,
+) -> dict[str, str]:
+    """
+    Choose the structured code after the retry loop ends.
+
+    - timeout / DeadlineExceeded stay timeout (even after retries)
+    - schema / malformed JSON stay invalid_response
+    - other API exceptions after more than one attempt → retries_exhausted
+    - other one-shot API / network failures → unavailable
+    """
+    if last_kind == ERROR_CODE_TIMEOUT:
+        code = ERROR_CODE_TIMEOUT
+    elif last_kind == ERROR_CODE_INVALID_RESPONSE:
+        code = ERROR_CODE_INVALID_RESPONSE
+    elif last_was_api_exception and attempts > 1:
+        code = ERROR_CODE_RETRIES_EXHAUSTED
+    elif last_kind in AI_ERROR_CODES:
+        code = last_kind
+    else:
+        code = ERROR_CODE_UNAVAILABLE
+    return _structured_ai_error(code, last_detail)
+
+
+def _mark_gemini_success(ai_fields: dict[str, Any]) -> dict[str, Any]:
+    """Attach the success marker Data/Flask can trust. Never used on failure."""
+    marked = dict(ai_fields)
+    marked["source"] = AI_SOURCE
+    return marked
 
 
 def build_prompt(student_dict: dict[str, Any]) -> str:
@@ -339,44 +481,59 @@ def call_gemini(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     retry_delay_sec: float = _DEFAULT_RETRY_DELAY_SEC,
     generate_fn: Callable[[str, str, str], str] | None = None,
-) -> tuple[bool, dict[str, Any] | None, str | None]:
+) -> tuple[bool, dict[str, Any] | None, dict[str, str] | None]:
     """
     Call Gemini with structured JSON output, validate schema, retry on failure.
 
     Returns (ok, validated_ai_dict_or_None, error_or_None).
+    On failure, error is {"error_code", "detail", "source": "gemini"}.
     Never crashes the program on API / timeout / malformed JSON.
+    Never invents soft_label / tips / speak_prominence on failure.
     """
     key = (api_key if api_key is not None else os.environ.get("GEMINI_API_KEY", "")).strip()
     generator = generate_fn if generate_fn is not None else _default_generate
 
+    # Env-only key. Do not attempt the real API when it is missing/blank.
+    # generate_fn injection is for tests and still runs without a key.
     if generate_fn is None and not key:
-        msg = "GEMINI_API_KEY is not set; cannot call Gemini."
-        logger.error(msg)
-        return False, None, msg
+        detail = "GEMINI_API_KEY is not set; cannot call Gemini."
+        logger.error(detail)
+        return False, None, _structured_ai_error(ERROR_CODE_MISSING_API_KEY, detail)
 
-    last_error = "Unknown AI failure."
+    last_detail = "Unknown AI failure."
+    last_kind = ERROR_CODE_UNAVAILABLE
+    last_was_api_exception = False
     attempts = max(1, int(max_attempts))
 
     for attempt in range(1, attempts + 1):
         try:
             raw_text = generator(prompt, key, model_name)
         except Exception as exc:  # noqa: BLE001 — must not crash pipeline
-            last_error = f"Gemini API failure (attempt {attempt}/{attempts}): {exc}"
-            logger.warning(last_error)
+            last_was_api_exception = True
+            last_kind = classify_ai_error(exc)
+            last_detail = f"Gemini API failure (attempt {attempt}/{attempts}): {exc}"
+            logger.warning(last_detail)
             if attempt < attempts:
                 time.sleep(retry_delay_sec)
             continue
 
         ok, result = validate_ai_response(raw_text)
         if ok:
-            return True, result, None
+            return True, _mark_gemini_success(result), None
 
-        last_error = f"Schema validation failed (attempt {attempt}/{attempts}): {result}"
-        logger.warning(last_error)
+        last_was_api_exception = False
+        last_kind = ERROR_CODE_INVALID_RESPONSE
+        last_detail = f"Schema validation failed (attempt {attempt}/{attempts}): {result}"
+        logger.warning(last_detail)
         if attempt < attempts:
             time.sleep(retry_delay_sec)
 
-    return False, None, last_error
+    return False, None, _final_ai_error(
+        last_kind,
+        last_detail,
+        attempts=attempts,
+        last_was_api_exception=last_was_api_exception,
+    )
 
 
 def analyse_student(
@@ -387,18 +544,23 @@ def analyse_student(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     retry_delay_sec: float = _DEFAULT_RETRY_DELAY_SEC,
     generate_fn: Callable[[str, str, str], str] | None = None,
-) -> tuple[bool, dict[str, Any] | None, str | None]:
+) -> tuple[bool, dict[str, Any] | None, dict[str, str] | None]:
     """
     Entry point for the AI Processing Layer.
 
     Builds prompt → calls Gemini → validates schema → merges AI fields into
-    a shallow copy of the student record for logic_manager / the Flask UI.
+    a shallow copy of the student record. Every successful record is marked
+    source="gemini" so Data/Flask can trust Gemini processing.
 
     Returns (ok, enriched_record_or_None, error_or_None). Never raises for
-    API / schema failures.
+    API / schema failures. On failure the record is None (no invented
+    soft_label / tips / speak_prominence).
     """
     if not isinstance(student_dict, dict):
-        return False, None, "student_dict must be a dict from io_manager."
+        return False, None, _structured_ai_error(
+            ERROR_CODE_INVALID_RESPONSE,
+            "student_dict must be a dict from io_manager.",
+        )
 
     prompt = build_prompt(student_dict)
     ok, ai_fields, err = call_gemini(
@@ -414,4 +576,5 @@ def analyse_student(
 
     enriched = dict(student_dict)
     enriched.update(ai_fields)
+    enriched["source"] = AI_SOURCE
     return True, enriched, None
