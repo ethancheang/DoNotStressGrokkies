@@ -18,7 +18,9 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# Locked allow-lists (AI / I/O layers should mirror these exact strings)
+# Locked allow-lists — copied verbatim from io_manager (PR #6)
+# so Flask format_soft_label / format_tips / format_speak_to_advisor_panel
+# render identically on the Gemini fallback path.
 # ---------------------------------------------------------------------------
 
 SOFT_LABELS = (
@@ -29,16 +31,41 @@ SOFT_LABELS = (
 
 SPEAK_PROMINENCE = ("low", "medium", "high")
 
-ALLOWED_TIPS = (
-    "Keep a steady sleep schedule this week.",
-    "Take short breaks between study blocks.",
-    "Break big tasks into smaller steps.",
-    "Reach out to a friend or family member.",
-    "Try a short walk or stretch when stress spikes.",
-    "Check campus wellbeing resources if things feel heavy.",
-    "Talk with an academic advisor about workload.",
-    "Consider a budgeting or financial-aid check-in.",
-)
+# Tip IDs that templates / other layers may pass into format_tips.
+# Copy is student-facing. Do not add phone numbers or extra emails here.
+TIPS_ALLOWLIST = {
+    "sleep_routine": (
+        "Try to keep a regular sleep schedule, including on weekends."
+    ),
+    "rest_a_little_more": (
+        "If you can, give yourself a bit more rest — even 30 extra minutes "
+        "can help."
+    ),
+    "short_breaks": (
+        "Take short, planned breaks between study blocks instead of pushing "
+        "through without a pause."
+    ),
+    "workload_chunks": (
+        "Break larger assignments into smaller tasks and spread them across "
+        "the week."
+    ),
+    "money_worries": (
+        "If money is on your mind, campus support can help you find the "
+        "right next step."
+    ),
+    "talk_to_someone": (
+        "Reach out to a friend, classmate, or family member — you do not "
+        "have to handle this alone."
+    ),
+    "keep_social_contact": (
+        "Stay in touch with people who help you feel supported, even with "
+        "a short check-in."
+    ),
+    "feelings_check_in": (
+        "Name how you have been feeling and give yourself permission to "
+        "ask for help if school feels heavy."
+    ),
+}
 
 RISK_CATEGORIES = ("Low", "Moderate", "High")
 LOGIC_SOURCE = "logic_fallback"
@@ -52,15 +79,15 @@ _WORKLOAD_DEFAULT = 3
 _FINANCIAL_DEFAULT = 2
 _SUPPORT_DEFAULT = 8
 
-# Tip indices into ALLOWED_TIPS (keeps selection aligned with the allow-list).
-_TIP_SLEEP = ALLOWED_TIPS[0]
-_TIP_BREAKS = ALLOWED_TIPS[1]
-_TIP_SMALL_STEPS = ALLOWED_TIPS[2]
-_TIP_FRIEND = ALLOWED_TIPS[3]
-_TIP_WALK = ALLOWED_TIPS[4]
-_TIP_WELLBEING = ALLOWED_TIPS[5]
-_TIP_ADVISOR = ALLOWED_TIPS[6]
-_TIP_FINANCIAL = ALLOWED_TIPS[7]
+# Tip IDs returned in `tips` — io_manager.format_tips accepts these keys.
+_TIP_SLEEP = "sleep_routine"
+_TIP_REST = "rest_a_little_more"
+_TIP_BREAKS = "short_breaks"
+_TIP_CHUNKS = "workload_chunks"
+_TIP_MONEY = "money_worries"
+_TIP_TALK = "talk_to_someone"
+_TIP_SOCIAL = "keep_social_contact"
+_TIP_FEELINGS = "feelings_check_in"
 
 _MIN_TIPS = 2
 _MAX_TIPS = 4
@@ -97,6 +124,9 @@ def assign_soft_outcome(record: dict[str, Any]) -> dict[str, Any]:
 
     You're doing ok / speak_prominence low / Low: default
 
+    `tips` is a list of TIPS_ALLOWLIST keys (not copy text) so
+    io_manager.format_tips can resolve the student-facing strings.
+
     risk_score is a separate 0.0–1.0 logging heuristic (see _risk_score).
     """
     sleep, stress, workload, financial, support = _read_numeric_fields(record)
@@ -109,7 +139,7 @@ def assign_soft_outcome(record: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "soft_label": _BAND_TO_LABEL[band],
-        "tips": tips,
+        "tips": tips,  # list of TIPS_ALLOWLIST keys for io_manager.format_tips
         "speak_prominence": _BAND_TO_PROMINENCE[band],
         "risk_score": score,
         "risk_category": _BAND_TO_CATEGORY[band],
@@ -283,42 +313,46 @@ def _risk_score(
 
 
 # ---------------------------------------------------------------------------
-# Tips — subset of ALLOWED_TIPS, 2–4 unique items, driven by fired signals
+# Tips — 2–4 unique TIPS_ALLOWLIST IDs, driven by fired signals.
+# IDs (not copy text) so io_manager.format_tips can resolve UI strings.
 # ---------------------------------------------------------------------------
 
 def _select_tips(flags: dict[str, bool], band: str) -> list[str]:
     ordered: list[str] = []
 
-    # Order so rule-critical signals (sleep, stress, support, financial)
-    # land in the 2–4 tip window before extra workload suggestions.
+    # Order so rule-critical signals land in the 2–4 tip window.
     if band == "high":
-        ordered.append(_TIP_WELLBEING)
+        ordered.append(_TIP_FEELINGS)
+        ordered.append(_TIP_TALK)
     if flags["sleep_short"]:
         ordered.append(_TIP_SLEEP)
-    if flags["stress_elevated"]:
-        ordered.append(_TIP_WALK)
+    if flags["sleep_very_low"]:
+        ordered.append(_TIP_REST)
+    if flags["stress_elevated"] and band != "high":
+        ordered.append(_TIP_FEELINGS)
     if flags["support_somewhat_low"]:
-        ordered.append(_TIP_FRIEND)
+        ordered.append(_TIP_TALK)
+        ordered.append(_TIP_SOCIAL)
     if flags["financial_elevated"]:
-        ordered.append(_TIP_FINANCIAL)
+        ordered.append(_TIP_MONEY)
     if flags["workload_high"]:
-        ordered.append(_TIP_ADVISOR)
-        ordered.append(_TIP_SMALL_STEPS)
+        ordered.append(_TIP_CHUNKS)
+        ordered.append(_TIP_BREAKS)
     elif flags["workload_elevated"]:
         ordered.append(_TIP_BREAKS)
-        ordered.append(_TIP_SMALL_STEPS)
+        ordered.append(_TIP_CHUNKS)
 
     unique: list[str] = []
-    for tip in ordered:
-        if tip in ALLOWED_TIPS and tip not in unique:
-            unique.append(tip)
+    for tip_id in ordered:
+        if tip_id in TIPS_ALLOWLIST and tip_id not in unique:
+            unique.append(tip_id)
 
-    pad_order = (_TIP_SLEEP, _TIP_BREAKS, _TIP_WALK)
-    for tip in pad_order:
+    pad_order = (_TIP_SLEEP, _TIP_BREAKS, _TIP_SOCIAL)
+    for tip_id in pad_order:
         if len(unique) >= _MIN_TIPS:
             break
-        if tip not in unique:
-            unique.append(tip)
+        if tip_id not in unique:
+            unique.append(tip_id)
 
     return unique[:_MAX_TIPS]
 

@@ -52,7 +52,9 @@ def _assert_valid_outcome(result: dict) -> None:
     assert isinstance(result["tips"], list)
     assert 2 <= len(result["tips"]) <= 4
     assert len(result["tips"]) == len(set(result["tips"]))
-    assert all(tip in lm.ALLOWED_TIPS for tip in result["tips"])
+    assert all(tip in lm.TIPS_ALLOWLIST for tip in result["tips"])
+    # IDs, not resolved copy — format_tips looks up TIPS_ALLOWLIST[id]
+    assert all(tip != lm.TIPS_ALLOWLIST[tip] for tip in result["tips"])
     assert isinstance(result["risk_score"], float)
     assert 0.0 <= result["risk_score"] <= 1.0
 
@@ -97,16 +99,40 @@ def test_allow_list_constants_exported():
         "Please reach out",
     )
     assert lm.SPEAK_PROMINENCE == ("low", "medium", "high")
-    assert lm.ALLOWED_TIPS == (
-        "Keep a steady sleep schedule this week.",
-        "Take short breaks between study blocks.",
-        "Break big tasks into smaller steps.",
-        "Reach out to a friend or family member.",
-        "Try a short walk or stretch when stress spikes.",
-        "Check campus wellbeing resources if things feel heavy.",
-        "Talk with an academic advisor about workload.",
-        "Consider a budgeting or financial-aid check-in.",
-    )
+    assert lm.TIPS_ALLOWLIST == {
+        "sleep_routine": (
+            "Try to keep a regular sleep schedule, including on weekends."
+        ),
+        "rest_a_little_more": (
+            "If you can, give yourself a bit more rest — even 30 extra minutes "
+            "can help."
+        ),
+        "short_breaks": (
+            "Take short, planned breaks between study blocks instead of pushing "
+            "through without a pause."
+        ),
+        "workload_chunks": (
+            "Break larger assignments into smaller tasks and spread them across "
+            "the week."
+        ),
+        "money_worries": (
+            "If money is on your mind, campus support can help you find the "
+            "right next step."
+        ),
+        "talk_to_someone": (
+            "Reach out to a friend, classmate, or family member — you do not "
+            "have to handle this alone."
+        ),
+        "keep_social_contact": (
+            "Stay in touch with people who help you feel supported, even with "
+            "a short check-in."
+        ),
+        "feelings_check_in": (
+            "Name how you have been feeling and give yourself permission to "
+            "ask for help if school feels heavy."
+        ),
+    }
+    assert not hasattr(lm, "ALLOWED_TIPS")
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +143,8 @@ def test_high_stress_and_very_low_sleep():
     result = lm.assign_soft_outcome(_base(stress_level=8, sleep_hours=5.0))
     _assert_band(result, HIGH_LABEL, "high", "High")
     assert "high stress" in result["reasoning"].lower() or "sleep" in result["reasoning"].lower()
-    assert "Keep a steady sleep schedule this week." in result["tips"]
-    assert "Check campus wellbeing resources if things feel heavy." in result["tips"]
+    assert "sleep_routine" in result["tips"]
+    assert "feelings_check_in" in result["tips"]
 
 
 def test_high_stress_workload_and_very_low_support():
@@ -126,8 +152,8 @@ def test_high_stress_workload_and_very_low_support():
         _base(stress_level=9, academic_workload=8, social_support=3, sleep_hours=8.0)
     )
     _assert_band(result, HIGH_LABEL, "high", "High")
-    assert "Talk with an academic advisor about workload." in result["tips"]
-    assert "Reach out to a friend or family member." in result["tips"]
+    assert "workload_chunks" in result["tips"]
+    assert "talk_to_someone" in result["tips"]
 
 
 def test_high_financial_stress_and_low_support():
@@ -135,8 +161,8 @@ def test_high_financial_stress_and_low_support():
         _base(financial_stress=8, stress_level=7, social_support=4, sleep_hours=8.0)
     )
     _assert_band(result, HIGH_LABEL, "high", "High")
-    assert "Consider a budgeting or financial-aid check-in." in result["tips"]
-    assert "Reach out to a friend or family member." in result["tips"]
+    assert "money_worries" in result["tips"]
+    assert "talk_to_someone" in result["tips"]
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +172,8 @@ def test_high_financial_stress_and_low_support():
 def test_medium_elevated_stress_and_low_sleep():
     result = lm.assign_soft_outcome(_base(stress_level=6, sleep_hours=5.5))
     _assert_band(result, MED_LABEL, "medium", "Moderate")
-    assert "Keep a steady sleep schedule this week." in result["tips"]
-    assert "Try a short walk or stretch when stress spikes." in result["tips"]
+    assert "sleep_routine" in result["tips"]
+    assert "feelings_check_in" in result["tips"]
 
 
 def test_medium_elevated_stress_and_high_workload():
@@ -155,7 +181,7 @@ def test_medium_elevated_stress_and_high_workload():
         _base(stress_level=6, academic_workload=7, sleep_hours=8.0)
     )
     _assert_band(result, MED_LABEL, "medium", "Moderate")
-    assert "Take short breaks between study blocks." in result["tips"]
+    assert "short_breaks" in result["tips"]
 
 
 def test_medium_financial_and_low_support():
@@ -163,8 +189,8 @@ def test_medium_financial_and_low_support():
         _base(financial_stress=7, social_support=5, stress_level=3, sleep_hours=8.0)
     )
     _assert_band(result, MED_LABEL, "medium", "Moderate")
-    assert "Consider a budgeting or financial-aid check-in." in result["tips"]
-    assert "Reach out to a friend or family member." in result["tips"]
+    assert "money_worries" in result["tips"]
+    assert "talk_to_someone" in result["tips"]
 
 
 def test_medium_high_workload_and_short_sleep():
@@ -172,8 +198,8 @@ def test_medium_high_workload_and_short_sleep():
         _base(academic_workload=8, sleep_hours=6.0, stress_level=3)
     )
     _assert_band(result, MED_LABEL, "medium", "Moderate")
-    assert "Keep a steady sleep schedule this week." in result["tips"]
-    assert "Talk with an academic advisor about workload." in result["tips"]
+    assert "sleep_routine" in result["tips"]
+    assert "workload_chunks" in result["tips"]
 
 
 # ---------------------------------------------------------------------------
