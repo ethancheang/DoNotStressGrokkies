@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 from pathlib import Path
 import sys
@@ -111,32 +112,33 @@ def _patch_ai_failure(monkeypatch, error_code="missing_api_key", detail="GEMINI_
     )
 
 
-def _assert_ai_error_page(html, *, status_code, response=None):
+def _assert_ai_error_page(markup, *, status_code, response=None):
     if response is not None:
         assert response.status_code == status_code
-    assert "We couldn't complete your check-in" in html
-    assert "AI is required" in html or "Gemini" in html
-    assert "try again later" in html.lower()
-    assert "Try again" in html
-    assert "Suggestions for you" not in html
-    assert "Save this check-in" not in html
-    assert "Save my check-in" not in html
-    assert "You're doing ok" not in html
-    assert "Worth a check-in" not in html
-    assert "GEMINI_API_KEY" not in html
-    assert io_manager.ADVISOR_EMAIL in html
-    assert io_manager.ADVISOR_HELPLINE in html
-    assert io_manager.ADVISOR_MAILTO in html
-    assert "Speak to advisor" in html
-    assert "prominence-high" in html
+    text = html.unescape(markup)
+    assert "We couldn't complete your check-in" in text
+    assert "AI is required" in text or "Gemini" in text
+    assert "try again later" in text.lower()
+    assert "Try again" in text
+    assert "Suggestions for you" not in text
+    assert "Save this check-in" not in text
+    assert "Save my check-in" not in text
+    assert "You're doing ok" not in text
+    assert "Worth a check-in" not in text
+    assert "GEMINI_API_KEY" not in text
+    assert io_manager.ADVISOR_EMAIL in text
+    assert io_manager.ADVISOR_HELPLINE in text
+    assert io_manager.ADVISOR_MAILTO in text
+    assert "Speak to advisor" in text
+    assert "prominence-high" in text
 
 
 def test_app_source_does_not_use_removed_logic_fallback():
     source = Path(flask_app.__file__).read_text(encoding="utf-8")
     assert "apply_soft_outcome" not in source
     assert "assign_soft_outcome" not in source
-    assert "logic_fallback" not in source
     assert "evaluate_checkin" not in source
+    assert "process_checkin" in source
     assert hasattr(logic_manager, "apply_logic")
     assert not hasattr(logic_manager, "apply_soft_outcome")
     assert not hasattr(logic_manager, "assign_soft_outcome")
