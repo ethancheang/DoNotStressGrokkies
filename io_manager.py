@@ -4,8 +4,10 @@ Audience is students via a local Flask web UI (not advisors). This module
 owns pure-function validators and template formatters only.
 
 Joe's Flask app should import FORM_FIELDS / validate_student_form /
-format_* helpers. Do not put Gemini, Intervention Tier rules, or file I/O
-here. Functions only — no object types defined in this module.
+format_* helpers (including format_ai_unavailable_error / format_ai_error
+when Gemini cannot complete a check-in). Do not put Gemini, Intervention
+Tier rules, or file I/O here. Functions only — no object types defined
+in this module.
 
 Canonical Flask form field names (request.form keys) — use FORM_FIELDS:
   student_id          required  str   2-digit year in {23,24,25,26} + 5 digits
@@ -199,6 +201,52 @@ SPEAK_PANEL_COPY = {
     },
 }
 
+# Gemini is mandatory for every check-in result. These formatters exist so
+# Flask can show a hard-stop error page — not a logic-only / tips happy path.
+AI_UNAVAILABLE_HEADING = "We couldn't complete your check-in"
+AI_UNAVAILABLE_BODY = (
+    "This check-in needs Gemini AI before we can show a result. "
+    "AI is required for every record, so we cannot finish your check-in "
+    "right now. Please try again later."
+)
+AI_UNAVAILABLE_ACTION_LABEL = "Try again"
+AI_UNAVAILABLE_TONE = "urgent"
+AI_REQUIRED_HINT = (
+    "Operators/dev: Gemini AI is required for every check-in. Confirm "
+    "GEMINI_API_KEY is set in the environment. Do not share or display the key."
+)
+
+AI_ERROR_CODES = (
+    "missing_api_key",
+    "timeout",
+    "invalid_response",
+    "retries_exhausted",
+    "unavailable",
+)
+
+AI_ERROR_HINTS = {
+    "missing_api_key": (
+        "Operators/dev: GEMINI_API_KEY is not set. Add it to the environment "
+        "and restart the app. Never paste the key into the page or into "
+        "student-facing copy."
+    ),
+    "timeout": (
+        "Operators/dev: the Gemini request timed out. Confirm GEMINI_API_KEY "
+        "is set and the service is reachable, then try again. Do not share "
+        "the key."
+    ),
+    "invalid_response": (
+        "Operators/dev: Gemini returned a response that could not be used. "
+        "Confirm GEMINI_API_KEY is set and check server logs. Do not expose "
+        "the key."
+    ),
+    "retries_exhausted": (
+        "Operators/dev: Gemini failed after retries. Confirm GEMINI_API_KEY "
+        "is set and the service is reachable. Do not expose the key."
+    ),
+    "unavailable": AI_REQUIRED_HINT,
+}
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers (pure)
@@ -278,6 +326,34 @@ def _form_get(form_dict, key: str):
     if value is None:
         return ""
     return value
+
+
+def _looks_like_secret(text: str) -> bool:
+    """True when operator text might contain a key or token — do not show it."""
+    if not text:
+        return False
+    compact = "".join(text.split())
+    lowered = compact.lower()
+    if "gemini_api_key=" in lowered or "api_key=" in lowered:
+        return True
+    if "bearer" in lowered and len(compact) > 20:
+        return True
+    # Long token-like strings (Google API keys are typically 39+ chars).
+    if len(compact) >= 32 and compact.isalnum():
+        return True
+    return False
+
+
+def _sanitize_operator_detail(raw) -> str | None:
+    """Keep a short operator note; drop anything that looks like a secret."""
+    text = _as_text(raw)
+    if not text:
+        return None
+    if _looks_like_secret(text):
+        return None
+    if len(text) > 200:
+        text = text[:200].rstrip() + "…"
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +580,72 @@ def format_speak_to_advisor_panel(speak_prominence) -> dict:
         },
         "error": error,
     }
+
+
+def _ai_failure_copy(error_code, detail=None) -> dict:
+    """Shared payload for AI-required failure pages (no soft-label happy path)."""
+    code = _as_text(error_code).lower()
+    unknown = False
+    if code not in AI_ERROR_CODES:
+        unknown = bool(code)
+        code = "unavailable"
+    if not code:
+        code = "unavailable"
+
+    body = AI_UNAVAILABLE_BODY
+    hint = AI_ERROR_HINTS[code]
+    reason = _sanitize_operator_detail(detail)
+    if reason:
+        hint = f"{hint} Detail: {reason}."
+
+    panel = format_speak_to_advisor_panel("high")
+    error = None
+    if unknown:
+        allowed = ", ".join(AI_ERROR_CODES)
+        error = f"Unknown AI error_code. Use one of: {allowed}."
+
+    return {
+        "heading": AI_UNAVAILABLE_HEADING,
+        "body": body,
+        "message": body,
+        "hint": hint,
+        "action_label": AI_UNAVAILABLE_ACTION_LABEL,
+        "tone": AI_UNAVAILABLE_TONE,
+        "ai_required": True,
+        "error_code": code,
+        "reason": reason,
+        "speak_to_advisor": panel,
+        "email": ADVISOR_EMAIL,
+        "helpline": ADVISOR_HELPLINE,
+        "mailto": ADVISOR_MAILTO,
+        "contacts": {
+            "email": ADVISOR_EMAIL,
+            "helpline": ADVISOR_HELPLINE,
+            "mailto": ADVISOR_MAILTO,
+        },
+        "error": error,
+    }
+
+
+def format_ai_unavailable_error(reason=None) -> dict:
+    """Return template copy when Gemini is required but unavailable.
+
+    Plain dict for Flask error pages. Students are told AI is required and
+    to try again later. Operators get a GEMINI_API_KEY hint (no secrets).
+    Official SIT Counselling contacts stay visible via speak_to_advisor
+    (high prominence) — this is not a logic-only / tips happy path.
+    """
+    return _ai_failure_copy("unavailable", detail=reason)
+
+
+def format_ai_error(error_code, detail=None) -> dict:
+    """Map an AI failure code to the same student-facing error dict.
+
+    Known codes: missing_api_key, timeout, invalid_response,
+    retries_exhausted, unavailable. Unknown codes still return a valid
+    error page (unavailable copy + contacts) and set `error`.
+    """
+    return _ai_failure_copy(error_code, detail=detail)
 
 
 def format_student_record(record: dict) -> dict:
