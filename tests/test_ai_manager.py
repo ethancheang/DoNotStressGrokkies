@@ -239,6 +239,17 @@ def test_validate_rejects_off_list_primary_stressor():
     assert "allow-list" in err
 
 
+def _assert_structured_error(err, *allowed_codes):
+    assert isinstance(err, dict)
+    assert set(err) >= {"error_code", "detail", "source"}
+    assert err["error_code"] in allowed_codes
+    assert err["error_code"] in am.AI_ERROR_CODES
+    assert err["source"] == "gemini"
+    assert isinstance(err["detail"], str) and err["detail"]
+    for field in ("soft_label", "tips", "speak_prominence"):
+        assert field not in err
+
+
 def test_call_gemini_success_with_stub():
     ok, data, err = am.call_gemini("prompt", generate_fn=_fake_ok, max_attempts=1)
     assert ok is True
@@ -246,6 +257,7 @@ def test_call_gemini_success_with_stub():
     assert data["risk_category"] == "High"
     assert data["soft_label"] == "Please reach out"
     assert data["speak_prominence"] == "high"
+    assert data["source"] == "gemini"
 
 
 def test_call_gemini_retries_then_fails_on_malformed():
@@ -257,8 +269,8 @@ def test_call_gemini_retries_then_fails_on_malformed():
     )
     assert ok is False
     assert data is None
-    assert err is not None
-    assert "Schema validation failed" in err or "not valid JSON" in err
+    _assert_structured_error(err, "invalid_response", "retries_exhausted")
+    assert "Schema validation failed" in err["detail"] or "not valid JSON" in err["detail"]
 
 
 def test_call_gemini_retries_after_api_exception():
@@ -328,6 +340,7 @@ def test_analyse_student_merges_io_and_ai_fields():
     assert enriched["soft_label"] == "Please reach out"
     assert enriched["tips"] == VALID_AI["tips"]
     assert enriched["speak_prominence"] == "high"
+    assert enriched["source"] == "gemini"
     for name in DROPPED_FIELD_NAMES:
         assert name not in enriched
 
@@ -341,7 +354,7 @@ def test_analyse_student_soft_fails_without_crash():
     )
     assert ok is False
     assert enriched is None
-    assert isinstance(err, str) and len(err) > 0
+    _assert_structured_error(err, "invalid_response", "retries_exhausted")
 
 
 def test_analyse_student_rejects_non_dict_without_raising():
@@ -352,7 +365,8 @@ def test_analyse_student_rejects_non_dict_without_raising():
     )
     assert ok is False
     assert enriched is None
-    assert "dict" in err
+    _assert_structured_error(err, "invalid_response")
+    assert "dict" in err["detail"]
 
 
 def test_no_class_keyword_in_module_source():
@@ -386,3 +400,148 @@ def test_module_has_no_invented_tip_sentences():
     )
     for sentence in invented:
         assert sentence not in source
+
+
+def test_module_has_no_logic_fallback():
+    source = open(am.__file__, encoding="utf-8").read()
+    assert "import logic_manager" not in source
+    assert "from logic_manager" not in source
+    assert "logic_fallback" not in source
+    assert "apply_soft_outcome" not in source
+    assert "assign_soft_outcome" not in source
+
+
+def test_call_gemini_missing_api_key(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    called = {"n": 0}
+
+    def must_not_run(_prompt: str, _key: str, _model: str) -> str:
+        called["n"] += 1
+        raise AssertionError("Gemini must not be called when the API key is missing")
+
+    # Real path: no generate_fn, blank env key → do not attempt the API.
+    monkeypatch.setattr(am, "_default_generate", must_not_run)
+    ok, data, err = am.call_gemini("prompt", max_attempts=3, retry_delay_sec=0.0)
+    assert ok is False
+    assert data is None
+    assert called["n"] == 0
+    _assert_structured_error(err, "missing_api_key")
+    assert "GEMINI_API_KEY" in err["detail"]
+
+
+def test_analyse_student_missing_api_key_does_not_invent_product(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    ok, enriched, err = am.analyse_student(SAMPLE_STUDENT, max_attempts=1)
+    assert ok is False
+    assert enriched is None
+    _assert_structured_error(err, "missing_api_key")
+
+
+def test_call_gemini_timeout_stub():
+    def boom(_prompt: str, _key: str, _model: str) -> str:
+        raise TimeoutError("simulated timeout")
+
+    ok, data, err = am.call_gemini(
+        "prompt",
+        generate_fn=boom,
+        max_attempts=1,
+        retry_delay_sec=0.0,
+    )
+    assert ok is False
+    assert data is None
+    _assert_structured_error(err, "timeout", "retries_exhausted")
+    assert err["error_code"] == "timeout"
+
+
+def test_call_gemini_timeout_after_retries_stays_timeout_or_exhausted():
+    def boom(_prompt: str, _key: str, _model: str) -> str:
+        raise TimeoutError("DeadlineExceeded: timed out")
+
+    ok, data, err = am.call_gemini(
+        "prompt",
+        generate_fn=boom,
+        max_attempts=3,
+        retry_delay_sec=0.0,
+    )
+    assert ok is False
+    assert data is None
+    _assert_structured_error(err, "timeout", "retries_exhausted")
+
+
+def test_call_gemini_other_api_exception_exhausted():
+    def boom(_prompt: str, _key: str, _model: str) -> str:
+        raise ConnectionError("gemini unreachable")
+
+    ok, data, err = am.call_gemini(
+        "prompt",
+        generate_fn=boom,
+        max_attempts=3,
+        retry_delay_sec=0.0,
+    )
+    assert ok is False
+    assert data is None
+    _assert_structured_error(err, "retries_exhausted", "unavailable")
+    assert err["error_code"] == "retries_exhausted"
+
+
+def test_call_gemini_other_api_exception_one_shot_unavailable():
+    def boom(_prompt: str, _key: str, _model: str) -> str:
+        raise ConnectionError("gemini unreachable")
+
+    ok, data, err = am.call_gemini(
+        "prompt",
+        generate_fn=boom,
+        max_attempts=1,
+        retry_delay_sec=0.0,
+    )
+    assert ok is False
+    assert data is None
+    _assert_structured_error(err, "unavailable")
+
+
+def test_malformed_json_after_retries_is_invalid_or_exhausted():
+    ok, data, err = am.call_gemini(
+        "prompt",
+        generate_fn=_fake_malformed,
+        max_attempts=3,
+        retry_delay_sec=0.0,
+    )
+    assert ok is False
+    assert data is None
+    _assert_structured_error(err, "invalid_response", "retries_exhausted")
+
+
+def test_analyse_student_malformed_does_not_invent_soft_fields():
+    ok, enriched, err = am.analyse_student(
+        SAMPLE_STUDENT,
+        generate_fn=_fake_malformed,
+        max_attempts=3,
+        retry_delay_sec=0.0,
+    )
+    assert ok is False
+    assert enriched is None
+    _assert_structured_error(err, "invalid_response", "retries_exhausted")
+
+
+def test_classify_ai_error_mapping():
+    assert am.classify_ai_error(TimeoutError("timed out")) == "timeout"
+    assert am.classify_ai_error("DeadlineExceeded") == "timeout"
+    assert am.classify_ai_error("GEMINI_API_KEY is not set") == "missing_api_key"
+    assert am.classify_ai_error("Schema validation failed: not valid JSON") == (
+        "invalid_response"
+    )
+    assert am.classify_ai_error(ConnectionError("dns")) == "unavailable"
+    assert am.classify_ai_error({"error_code": "retries_exhausted"}) == (
+        "retries_exhausted"
+    )
+
+
+def test_error_codes_match_io_format_ai_error():
+    expected = (
+        "missing_api_key",
+        "timeout",
+        "invalid_response",
+        "retries_exhausted",
+        "unavailable",
+    )
+    assert am.AI_ERROR_CODES == expected
