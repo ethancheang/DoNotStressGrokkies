@@ -177,6 +177,11 @@ textarea {
   font: inherit;
   font-weight: 700;
   cursor: pointer;
+  text-decoration: none;
+}
+
+.error-actions {
+  margin: 1rem 0 0;
 }
 
 .btn.primary {

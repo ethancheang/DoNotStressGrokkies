@@ -3,10 +3,12 @@
 Wires the merged layers; does not reimplement their rules:
 
   1. io_manager.validate_student_form(...)
-  2. ai_manager.analyse_student(...)  (Gemini when GEMINI_API_KEY is set)
-  3. logic_manager.apply_soft_outcome(...)  (fallback; uses assign_soft_outcome)
+  2. ai_manager.analyse_student(...) — MUST succeed (Gemini)
+  3. logic_manager.apply_logic(...) / finalize_outcome only on AI success
+     (source becomes ai_logic). Logic never replaces missing AI.
   4. io_manager format_soft_label / format_tips / format_speak_to_advisor_panel
-  5. data_manager.save_record(..., opt_in=True)  only after explicit consent
+  5. data_manager.save_record(..., opt_in=True) only after explicit consent
+     and only for successful AI-processed records
 """
 
 from __future__ import annotations
@@ -34,34 +36,91 @@ logger = logging.getLogger(__name__)
 
 SESSION_RECORD_KEY = "pending_record"
 SESSION_SAVED_KEY = "checkin_saved"
-GEMINI_SOURCE = "gemini"
+AI_FAILURE_HTTP_STATUS = 503
+_AI_SUCCESS_SOURCES = frozenset({
+    "gemini",
+    "ai",
+    "ai_manager",
+    "gemini+logic",
+    "ai_logic",
+})
+_BLOCKED_SOURCES = frozenset({
+    "logic_fallback",
+    "fallback",
+    "logic_only",
+    "logic",
+})
 
 
-def evaluate_checkin(
+def _ai_error_copy(error: Any) -> dict[str, Any]:
+    """Map analyse_student's error payload to io_manager error-page copy."""
+    if error is None:
+        return io_manager.format_ai_unavailable_error()
+    if isinstance(error, dict):
+        code = error.get("error_code")
+        detail = error.get("detail")
+        if code:
+            return io_manager.format_ai_error(code, detail=detail)
+        return io_manager.format_ai_unavailable_error(detail)
+    code = ai_manager.classify_ai_error(error)
+    return io_manager.format_ai_error(code, detail=str(error))
+
+
+def _is_successful_ai_record(record: Any) -> bool:
+    """True only for a Gemini-processed record that Logic was allowed to finalize."""
+    if not isinstance(record, dict):
+        return False
+    if record.get("ok") is False:
+        return False
+    source = str(record.get("source", "")).strip().lower()
+    if source in _BLOCKED_SOURCES:
+        return False
+    required = ("soft_label", "tips", "speak_prominence")
+    if any(key not in record for key in required):
+        return False
+    return record.get("ai_ok") is True or source in _AI_SUCCESS_SOURCES
+
+
+def process_checkin(
     record: dict[str, Any],
     *,
     generate_fn: Callable[[str, str, str], str] | None = None,
     max_attempts: int = 3,
     retry_delay_sec: float = 0.5,
-) -> dict[str, Any]:
-    """Run AI first; fall back to logic_manager soft outcomes."""
+) -> tuple[bool, dict[str, Any]]:
+    """Run mandatory AI, then Logic finalize. Never invent a Logic-only outcome.
+
+    Returns (True, finalized_record) on success.
+    Returns (False, io_manager error-copy dict) on AI or Logic hard-stop.
+    """
     ok, enriched, error = ai_manager.analyse_student(
         record,
         generate_fn=generate_fn,
         max_attempts=max_attempts,
         retry_delay_sec=retry_delay_sec,
     )
-    if ok and isinstance(enriched, dict):
-        result = dict(enriched)
-        result.setdefault("source", GEMINI_SOURCE)
-        return result
+    if not ok or not isinstance(enriched, dict):
+        copy = _ai_error_copy(error)
+        logger.warning(
+            "AI check-in failed (%s): %s",
+            copy.get("error_code"),
+            copy.get("hint"),
+        )
+        return False, copy
 
-    logger.info("AI path unavailable; using logic fallback: %s", error)
-    return logic_manager.apply_soft_outcome(record)
+    finalized = logic_manager.apply_logic(enriched)
+    if not isinstance(finalized, dict) or not finalized.get("ok"):
+        reason = None
+        if isinstance(finalized, dict):
+            reason = finalized.get("message") or finalized.get("error")
+        logger.warning("Logic refused to finalize an AI record: %s", reason)
+        return False, io_manager.format_ai_unavailable_error(reason)
+
+    return True, finalized
 
 
 def _result_view(record: dict[str, Any]) -> dict[str, Any]:
-    """Build template context from a evaluated record via io_manager formatters."""
+    """Build template context from an evaluated record via io_manager formatters."""
     return {
         "soft": io_manager.format_soft_label(record.get("soft_label")),
         "tips": io_manager.format_tips(record.get("tips")),
@@ -84,6 +143,16 @@ def _form_values(form=None) -> dict[str, str]:
         raw = getter(key)
         values[key] = "" if raw is None else str(raw)
     return values
+
+
+def _clear_pending_checkin() -> None:
+    session.pop(SESSION_RECORD_KEY, None)
+    session.pop(SESSION_SAVED_KEY, None)
+
+
+def _render_ai_error(copy: dict[str, Any], *, status: int = AI_FAILURE_HTTP_STATUS):
+    flash(copy.get("heading") or "We couldn't complete your check-in", "error")
+    return render_template("ai_error.html", **copy), status
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
@@ -135,13 +204,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 errors=payload,
             ), 400
 
-        record = evaluate_checkin(
+        ok, result = process_checkin(
             payload,
             generate_fn=app.config.get("AI_GENERATE_FN"),
             max_attempts=app.config.get("AI_MAX_ATTEMPTS", 3),
             retry_delay_sec=app.config.get("AI_RETRY_DELAY_SEC", 0.5),
         )
-        session[SESSION_RECORD_KEY] = record
+        if not ok:
+            _clear_pending_checkin()
+            return _render_ai_error(result)
+
+        session[SESSION_RECORD_KEY] = result
         session[SESSION_SAVED_KEY] = False
         return redirect(url_for("result"))
 
@@ -151,6 +224,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if not record:
             flash("Start with a check-in first.", "info")
             return redirect(url_for("checkin"))
+        if not _is_successful_ai_record(record):
+            _clear_pending_checkin()
+            return _render_ai_error(io_manager.format_ai_unavailable_error())
         return render_template("result.html", **_result_view(record))
 
     @app.post("/save")
@@ -159,6 +235,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if not record:
             flash("Start with a check-in first.", "info")
             return redirect(url_for("checkin"))
+        if not _is_successful_ai_record(record):
+            _clear_pending_checkin()
+            return _render_ai_error(io_manager.format_ai_unavailable_error())
 
         opted_in = request.form.get("opt_in")
         if not opted_in:
@@ -182,8 +261,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/new")
     def new_checkin():
-        session.pop(SESSION_RECORD_KEY, None)
-        session.pop(SESSION_SAVED_KEY, None)
+        _clear_pending_checkin()
         return redirect(url_for("checkin"))
 
     return app
