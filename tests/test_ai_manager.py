@@ -31,11 +31,7 @@ VALID_AI = {
     "confidence": 0.91,
     "reasoning": "Sleep is low, stress and workload are high, and support feels thin.",
     "soft_label": "Please reach out",
-    "tips": [
-        "Keep a regular sleep window and protect at least one rest night this week.",
-        "Talk to someone you trust about how school has felt lately.",
-        "Check in with SIT Counselling if you want a confidential conversation.",
-    ],
+    "tips": ["sleep_routine", "talk_to_someone", "feelings_check_in"],
     "speak_prominence": "high",
 }
 
@@ -54,6 +50,25 @@ def _fake_malformed(_prompt: str, _key: str, _model: str) -> str:
     return "not-json-at-all"
 
 
+def test_allowlists_match_io_manager_pr6():
+    assert am.SOFT_LABELS == (
+        "You're doing ok",
+        "Worth a check-in",
+        "Please reach out",
+    )
+    assert am.TIPS_ALLOWLIST == (
+        "sleep_routine",
+        "rest_a_little_more",
+        "short_breaks",
+        "workload_chunks",
+        "money_worries",
+        "talk_to_someone",
+        "keep_social_contact",
+        "feelings_check_in",
+    )
+    assert am.SPEAK_PROMINENCE == ("low", "medium", "high")
+
+
 def test_build_prompt_includes_feelings_text_and_student_fields():
     prompt = am.build_prompt(SAMPLE_STUDENT)
     assert "feelings_text" in prompt
@@ -67,6 +82,10 @@ def test_build_prompt_includes_feelings_text_and_student_fields():
     assert "speak_prominence" in prompt
     assert "Never invent phone numbers, emails, or offices" in prompt
     assert "Do not include contact details in JSON" in prompt
+    assert "You're doing ok" in prompt
+    assert "tip IDs" in prompt
+    for tip_id in am.TIPS_ALLOWLIST:
+        assert tip_id in prompt
 
 
 def test_build_prompt_omits_dropped_fields():
@@ -94,7 +113,8 @@ def test_validate_ai_response_accepts_valid_dict():
     assert result["soft_label"] == "Please reach out"
     assert result["speak_prominence"] == "high"
     assert 1 <= len(result["tips"]) <= 3
-    assert all(tip in am.ALLOWED_TIPS_SET for tip in result["tips"])
+    assert all(tip in am.ALLOWED_TIP_IDS for tip in result["tips"])
+    assert result["tips"] == ["sleep_routine", "talk_to_someone", "feelings_check_in"]
 
 
 def test_validate_ai_response_accepts_json_string():
@@ -104,14 +124,24 @@ def test_validate_ai_response_accepts_json_string():
     assert result["soft_label"] == VALID_AI["soft_label"]
 
 
-def test_validate_normalises_ascii_youre_doing_ok():
+def test_validate_keeps_ascii_youre_doing_ok():
     payload = dict(VALID_AI)
     payload["soft_label"] = "You're doing ok"
     payload["risk_category"] = "Low"
     payload["speak_prominence"] = "low"
     ok, result = am.validate_ai_response(payload)
     assert ok is True
-    assert result["soft_label"] == "You’re doing ok"
+    assert result["soft_label"] == "You're doing ok"
+
+
+def test_validate_normalises_curly_youre_to_ascii():
+    payload = dict(VALID_AI)
+    payload["soft_label"] = "You’re doing ok"
+    payload["risk_category"] = "Low"
+    payload["speak_prominence"] = "low"
+    ok, result = am.validate_ai_response(payload)
+    assert ok is True
+    assert result["soft_label"] == "You're doing ok"
 
 
 def test_validate_rejects_missing_fields():
@@ -154,7 +184,15 @@ def test_validate_rejects_off_list_soft_label():
     assert "soft_label" in err
 
 
-def test_validate_rejects_off_list_tips():
+def test_validate_rejects_off_list_tip_ids():
+    bad = dict(VALID_AI)
+    bad["tips"] = ["emergency_hotline"]
+    ok, err = am.validate_ai_response(bad)
+    assert ok is False
+    assert "tip" in err.lower()
+
+
+def test_validate_rejects_free_text_tips():
     bad = dict(VALID_AI)
     bad["tips"] = ["Call 6592 2030 right now for emergency help."]
     ok, err = am.validate_ai_response(bad)
@@ -170,7 +208,7 @@ def test_validate_rejects_empty_or_too_many_tips():
     assert "tips" in err
 
     too_many = dict(VALID_AI)
-    too_many["tips"] = list(am.ALLOWED_TIPS[:4])
+    too_many["tips"] = list(am.TIPS_ALLOWLIST[:4])
     ok, err = am.validate_ai_response(too_many)
     assert ok is False
     assert "tips" in err

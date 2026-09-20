@@ -40,26 +40,31 @@ STUDENT_PROMPT_FIELDS = (
 )
 
 # ---------------------------------------------------------------------------
-# Shared allow-lists — logic_manager fallback MUST use the same values
+# Shared allow-lists — MUST match io_manager (PR #6) exactly.
+# logic_manager fallback MUST use the same IDs / strings.
+# Tip *copy* lives in io_manager.format_tips — this layer returns IDs only.
 # ---------------------------------------------------------------------------
 
-# Product form uses a curly apostrophe (U+2019) in "You’re".
-SOFT_LABEL_OK = "You’re doing ok"
+SOFT_LABEL_OK = "You're doing ok"
 SOFT_LABEL_CHECK_IN = "Worth a check-in"
 SOFT_LABEL_REACH_OUT = "Please reach out"
-SOFT_LABEL_OK_ASCII = "You're doing ok"
+SOFT_LABEL_OK_CURLY = "You’re doing ok"
 
-ALLOWED_SOFT_LABELS = frozenset(
-    {SOFT_LABEL_OK, SOFT_LABEL_CHECK_IN, SOFT_LABEL_REACH_OUT}
+SOFT_LABELS = (
+    SOFT_LABEL_OK,
+    SOFT_LABEL_CHECK_IN,
+    SOFT_LABEL_REACH_OUT,
 )
+ALLOWED_SOFT_LABELS = frozenset(SOFT_LABELS)
 _SOFT_LABEL_ALIASES = {
     SOFT_LABEL_OK: SOFT_LABEL_OK,
-    SOFT_LABEL_OK_ASCII: SOFT_LABEL_OK,
+    SOFT_LABEL_OK_CURLY: SOFT_LABEL_OK,
     SOFT_LABEL_CHECK_IN: SOFT_LABEL_CHECK_IN,
     SOFT_LABEL_REACH_OUT: SOFT_LABEL_REACH_OUT,
 }
 
-ALLOWED_SPEAK_PROMINENCE = frozenset({"low", "medium", "high"})
+SPEAK_PROMINENCE = ("low", "medium", "high")
+ALLOWED_SPEAK_PROMINENCE = frozenset(SPEAK_PROMINENCE)
 ALLOWED_RISK_CATEGORIES = frozenset({"Low", "Moderate", "High"})
 
 ALLOWED_PRIMARY_STRESSORS = frozenset(
@@ -73,15 +78,18 @@ ALLOWED_PRIMARY_STRESSORS = frozenset(
     }
 )
 
-ALLOWED_TIPS = (
-    "Keep a regular sleep window and protect at least one rest night this week.",
-    "Try a 10-minute reset between study blocks (walk, water, stretch).",
-    "Break the next assignment into one small first step today.",
-    "Talk to someone you trust about how school has felt lately.",
-    "Check in with SIT Counselling if you want a confidential conversation.",
-    "If money stress is high, ask Student Services about financial support options.",
+# IDs only — same keys as io_manager.TIPS_ALLOWLIST. Do not invent tip text.
+TIPS_ALLOWLIST = (
+    "sleep_routine",
+    "rest_a_little_more",
+    "short_breaks",
+    "workload_chunks",
+    "money_worries",
+    "talk_to_someone",
+    "keep_social_contact",
+    "feelings_check_in",
 )
-ALLOWED_TIPS_SET = frozenset(ALLOWED_TIPS)
+ALLOWED_TIP_IDS = frozenset(TIPS_ALLOWLIST)
 
 _REQUIRED_FIELDS = (
     "risk_score",
@@ -120,7 +128,8 @@ def build_prompt(student_dict: dict[str, Any]) -> str:
     }
     record_json = json.dumps(payload, ensure_ascii=False, indent=2)
     stressor_list = ", ".join(sorted(ALLOWED_PRIMARY_STRESSORS))
-    tip_lines = "\n".join(f'  - "{tip}"' for tip in ALLOWED_TIPS)
+    tip_id_list = ", ".join(TIPS_ALLOWLIST)
+    soft_label_list = ", ".join(f'"{label}"' for label in SOFT_LABELS)
 
     return (
         "You are a supportive student-wellbeing assistant for DoNotStress, "
@@ -137,12 +146,11 @@ def build_prompt(student_dict: dict[str, Any]) -> str:
         '- "confidence": float between 0.0 and 1.0 (your confidence)\n'
         '- "reasoning": short plain-English explanation that is safe to show '
         "a student; do not invent contacts\n"
-        '- "soft_label": EXACTLY one of: "You’re doing ok", '
-        '"Worth a check-in", "Please reach out" '
-        "(use the curly apostrophe in You’re)\n"
-        '- "tips": list of 1 to 3 strings; each tip MUST be copied verbatim '
-        "from this allow-list (do not invent new tips):\n"
-        f"{tip_lines}\n"
+        f'- "soft_label": EXACTLY one of: {soft_label_list} '
+        "(ASCII apostrophe in You're doing ok)\n"
+        '- "tips": list of 1 to 3 tip IDs only (not sentences). Each ID MUST '
+        f"be one of: {tip_id_list}. Do not invent tip text or extra IDs. "
+        "The UI maps these IDs to student-facing copy.\n"
         '- "speak_prominence": one of "low", "medium", "high" — how strongly '
         "the UI should highlight Speak to advisor (always visible; more "
         "prominent when risk is higher)\n"
@@ -174,7 +182,7 @@ def _normalise_soft_label(value: Any) -> tuple[bool, Any]:
     if normalised is None:
         return (
             False,
-            'soft_label must be "You’re doing ok", "Worth a check-in", '
+            'soft_label must be "You\'re doing ok", "Worth a check-in", '
             'or "Please reach out".',
         )
     return True, normalised
@@ -199,22 +207,22 @@ def _normalise_stressors(value: Any) -> tuple[bool, Any]:
 
 def _normalise_tips(value: Any) -> tuple[bool, Any]:
     if not isinstance(value, list):
-        return False, "tips must be a list of 1–3 allow-listed strings."
+        return False, "tips must be a list of 1–3 allow-listed tip IDs."
     if len(value) < _TIPS_MIN or len(value) > _TIPS_MAX:
-        return False, "tips must contain between 1 and 3 allow-listed strings."
+        return False, "tips must contain between 1 and 3 allow-listed tip IDs."
     cleaned: list[str] = []
     seen: set[str] = set()
     for item in value:
         if not isinstance(item, str):
-            return False, "each tip must be a string copied from the allow-list."
-        tip = item.strip()
-        if tip not in ALLOWED_TIPS_SET:
-            return False, f"tip is not on the allow-list: {tip}"
-        if tip not in seen:
-            seen.add(tip)
-            cleaned.append(tip)
+            return False, "each tip must be an allow-listed tip ID."
+        tip_id = item.strip()
+        if tip_id not in ALLOWED_TIP_IDS:
+            return False, f"tip ID is not on the allow-list: {tip_id}"
+        if tip_id not in seen:
+            seen.add(tip_id)
+            cleaned.append(tip_id)
     if not cleaned:
-        return False, "tips must contain between 1 and 3 allow-listed strings."
+        return False, "tips must contain between 1 and 3 allow-listed tip IDs."
     return True, cleaned
 
 
