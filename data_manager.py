@@ -1,9 +1,22 @@
 """
 DoNotStress — Data Layer (data_manager)
 
-Sole owner of flat-file persistence for fully evaluated student records.
+Sole owner of flat-file persistence for evaluated student check-in records.
 Pure procedural Python: functions only — no classes.
-No terminal I/O (print / input), no AI calls, no business-tier rules.
+No terminal I/O (print / input), no AI calls, no soft-label / tier rules.
+
+Flask / web usage (opt-in only)
+--------------------------------
+Never call save by default. Persist only after the student explicitly consents
+on the result page, then:
+
+    from data_manager import save_record
+
+    result = save_record(full_record, opt_in=True)
+    # result["ok"] is False if opt_in is missing/false — nothing is written.
+
+`full_record` should include student inputs + analysis outputs
+(soft_label, tips, speak_prominence, risk fields, reasoning, source=gemini|fallback).
 """
 
 from __future__ import annotations
@@ -31,6 +44,15 @@ def _resolve_path(data_path: str | None) -> Path:
     if data_path is None or str(data_path).strip() == "":
         return Path(get_default_data_path())
     return Path(data_path)
+
+
+def _is_opted_in(opt_in: Any) -> bool:
+    """True only for explicit consent: True, or common truthy form values."""
+    if opt_in is True:
+        return True
+    if isinstance(opt_in, str) and opt_in.strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -106,21 +128,37 @@ def load_all_records(data_path: str | None = None) -> dict[str, Any]:
     }
 
 
-def save_record(record: dict[str, Any], data_path: str | None = None) -> dict[str, Any]:
+def save_record(
+    record: dict[str, Any],
+    data_path: str | None = None,
+    *,
+    opt_in: Any = False,
+) -> dict[str, Any]:
     """
-    Append one fully evaluated student record (inputs + AI + tier).
-    Adds saved_at (UTC ISO) if not already present.
+    Append one evaluated student record **only if opt_in is explicit consent**.
+
+    Default is no save: call with opt_in=True after the student opts in on the UI.
+    Adds saved_at (UTC ISO) and save_opt_in=True on the stored row.
     Returns {"ok": bool, "error": str|None, "path": str, "record": dict|None}.
     """
+    path = _resolve_path(data_path)
+
+    if not _is_opted_in(opt_in):
+        return {
+            "ok": False,
+            "error": "Save refused: student opt-in required (pass opt_in=True).",
+            "path": str(path),
+            "record": None,
+        }
+
     if not isinstance(record, dict):
         return {
             "ok": False,
             "error": "record must be a dict",
-            "path": str(_resolve_path(data_path)),
+            "path": str(path),
             "record": None,
         }
 
-    path = _resolve_path(data_path)
     ok, records, load_error = _read_records_file(path)
     if not ok:
         return {"ok": False, "error": load_error, "path": str(path), "record": None}
@@ -131,6 +169,7 @@ def save_record(record: dict[str, Any], data_path: str | None = None) -> dict[st
         records = []
 
     stored = dict(record)
+    stored["save_opt_in"] = True
     if "saved_at" not in stored or not stored.get("saved_at"):
         stored["saved_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -145,12 +184,14 @@ def save_record(record: dict[str, Any], data_path: str | None = None) -> dict[st
 def filter_records(records: list[dict[str, Any]], **filters: Any) -> list[dict[str, Any]]:
     """
     Pure in-memory filter. Supported keys:
-      intervention_tier / tier, student_id, risk_category, cohort_year (2-digit prefix)
+      soft_label, intervention_tier / tier, student_id, risk_category,
+      cohort_year (2-digit student_id prefix)
     Unknown keys are ignored. Missing fields on a record do not match.
     """
     if not isinstance(records, list):
         return []
 
+    soft_label = filters.get("soft_label")
     tier = filters.get("intervention_tier", filters.get("tier"))
     student_id = filters.get("student_id")
     risk_category = filters.get("risk_category")
@@ -160,6 +201,9 @@ def filter_records(records: list[dict[str, Any]], **filters: Any) -> list[dict[s
     for rec in records:
         if not isinstance(rec, dict):
             continue
+        if soft_label is not None:
+            if str(rec.get("soft_label", "")) != str(soft_label):
+                continue
         if tier is not None:
             rec_tier = rec.get("intervention_tier", rec.get("tier"))
             try:
@@ -185,6 +229,13 @@ def filter_records(records: list[dict[str, Any]], **filters: Any) -> list[dict[s
 def get_records_by_tier(tier: int, data_path: str | None = None) -> list[dict[str, Any]]:
     loaded = load_all_records(data_path)
     return filter_records(loaded["records"], intervention_tier=tier)
+
+
+def get_records_by_soft_label(
+    soft_label: str, data_path: str | None = None
+) -> list[dict[str, Any]]:
+    loaded = load_all_records(data_path)
+    return filter_records(loaded["records"], soft_label=soft_label)
 
 
 def get_record_by_student_id(
