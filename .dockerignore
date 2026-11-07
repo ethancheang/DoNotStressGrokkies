@@ -1,0 +1,22 @@
+.git
+.gitignore
+.github
+.venv
+venv
+env
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.env
+.env.*
+.vscode
+.idea
+Dockerfile
+.dockerignore
+# Student data must never be baked into the image
+data/*.json
+data/*.json.*
+data/*.bak
+*.log
