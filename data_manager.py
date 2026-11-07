@@ -1,331 +1,167 @@
-"""
-DoNotStress — Data Layer (data_manager)
+"""DoNotStress — Data Layer (data_manager).
 
-Sole owner of flat-file persistence for evaluated student check-in records.
-Pure procedural Python: functions only — no classes.
-No terminal I/O (print / input), no AI calls, no soft-label / tier rules.
+DataManager is the only class that saves, loads and queries check-in
+records. It works through a StorageBackend, so it never touches files
+itself and a new backend needs no change here.
 
-Flask / web usage (opt-in + AI-success only)
----------------------------------------------
-Never call save by default. Persist only when BOTH are true:
-  1. the student explicitly consents on the result page (opt_in=True)
-  2. the record is a successful Gemini-processed result (not logic_fallback)
-
-    from data_manager import save_record
-
-    result = save_record(full_record, opt_in=True)
-    # refused if opt_in is false OR source is logic_fallback / AI fields missing
-
-`full_record` must include student inputs + AI outputs
-(soft_label, tips, speak_prominence, risk_score, risk_category, reasoning)
-with source "gemini" or post-Logic "ai_logic" (never "logic_fallback").
+A finished check-in is saved as a CheckInRecord; one the AI step could not
+finish is saved as a PendingRecord, and replace_pending_record later
+upgrades that same row. Reflection text is never stored. Each row gets a
+record_id (uuid4 hex) and a UTC saved_at time.
 """
 
 from __future__ import annotations
 
-import json
+import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+
+from base_manager import BaseManager
+from json_types import JSONObject
+from records.check_in_record import CheckInRecord
+from records.pending_record import PendingRecord
+from records.record import Record
+from records.stress_history import StressHistory
+from storage.save_result import SaveResult
+from storage.storage_backend import StorageBackend
+from storage.storage_error import StorageError
 
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+class DataManager(BaseManager):
+    """Saves and queries records through a backend it is given.
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent
-_DEFAULT_DATA_PATH = _PACKAGE_ROOT / "data" / "student_records.json"
-
-
-def get_default_data_path() -> str:
-    """Absolute path to the default JSON store."""
-    return str(_DEFAULT_DATA_PATH)
-
-
-def _resolve_path(data_path: str | None) -> Path:
-    if data_path is None or str(data_path).strip() == "":
-        return Path(get_default_data_path())
-    return Path(data_path)
-
-
-# Sources that mean Gemini never successfully processed this record.
-_BLOCKED_SOURCES = frozenset({
-    "logic_fallback",
-    "fallback",
-    "logic_only",
-    "logic",
-})
-
-# Accepted markers that the Gemini path succeeded (Logic may refine later).
-_AI_SUCCESS_SOURCES = frozenset({
-    "gemini",
-    "ai",
-    "ai_manager",
-    "gemini+logic",
-    "ai_logic",
-})
-
-_REQUIRED_AI_FIELDS = (
-    "soft_label",
-    "tips",
-    "speak_prominence",
-    "risk_score",
-    "risk_category",
-    "reasoning",
-)
-
-
-def _is_opted_in(opt_in: Any) -> bool:
-    """True only for explicit consent: True, or common truthy form values."""
-    if opt_in is True:
-        return True
-    if isinstance(opt_in, str) and opt_in.strip().lower() in {"1", "true", "yes", "on"}:
-        return True
-    return False
-
-
-def _ai_success_error(record: dict[str, Any]) -> str | None:
+    The backend is passed in and outlives this manager (aggregation).
     """
-    Return an error string if the record is not a successful AI-processed result.
-    Fail closed: missing source / missing AI fields / logic_fallback → refuse save.
-    """
-    if not isinstance(record, dict):
-        return "record must be a dict"
 
-    source = str(record.get("source", "")).strip().lower()
-    if source in _BLOCKED_SOURCES:
-        return (
-            "Save refused: record is not AI-processed "
-            f"(source={record.get('source')!r})."
-        )
-
-    explicit_ok = record.get("ai_ok") is True
-    source_ok = source in _AI_SUCCESS_SOURCES
-    if not explicit_ok and not source_ok:
-        return (
-            "Save refused: successful Gemini processing required "
-            "(set source to 'gemini' or ai_ok=True)."
-        )
-
-    missing = [name for name in _REQUIRED_AI_FIELDS if name not in record]
-    if missing:
-        return (
-            "Save refused: AI fields missing: " + ", ".join(missing) + "."
-        )
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Low-level load / save (graceful — never raise to callers for bad files)
-# ---------------------------------------------------------------------------
-
-def _ensure_parent_dir(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _read_records_file(path: Path) -> tuple[bool, list[dict[str, Any]], str | None]:
-    """
-    Load records from JSON.
-    Missing / empty / corrupt → (True, [], error_or_None) so callers never crash.
-    ok is True when the app can continue; error explains soft failures.
-    """
-    if not path.exists():
-        return True, [], None
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        return True, [], f"Could not read data file: {exc}"
-
-    if raw.strip() == "":
-        return True, [], None
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return True, [], f"Corrupted JSON in data file: {exc}"
-
-    if payload is None:
-        return True, [], None
-
-    if isinstance(payload, list):
-        records = [r for r in payload if isinstance(r, dict)]
-        return True, records, None
-
-    if isinstance(payload, dict) and isinstance(payload.get("records"), list):
-        records = [r for r in payload["records"] if isinstance(r, dict)]
-        return True, records, None
-
-    return True, [], "Data file JSON must be a list of records or an object with a 'records' list."
-
-
-def _write_records_file(path: Path, records: list[dict[str, Any]]) -> tuple[bool, str | None]:
-    try:
-        _ensure_parent_dir(path)
-        text = json.dumps(records, indent=2, ensure_ascii=False) + "\n"
-        path.write_text(text, encoding="utf-8")
-        return True, None
-    except OSError as exc:
-        return False, f"Could not write data file: {exc}"
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def load_all_records(data_path: str | None = None) -> dict[str, Any]:
-    """
-    Load all historical records (for startup / reports).
-    Returns {"ok": bool, "records": list, "error": str|None, "path": str}.
-    Never raises on missing, empty, or corrupted files.
-    """
-    path = _resolve_path(data_path)
-    ok, records, error = _read_records_file(path)
-    return {
-        "ok": ok,
-        "records": records,
-        "error": error,
-        "path": str(path),
+    TIER_TO_CATEGORY: dict[str, str] = {
+        "You're doing ok": "Low",
+        "Worth a check-in": "Moderate",
+        "Please reach out": "High",
     }
+    CONSENT_REQUIRED: str = ("Save refused: student opt-in required "
+                             "(pass opt_in=True).")
 
+    def __init__(self, backend: StorageBackend) -> None:
+        super().__init__("data_manager")
+        self.__backend: StorageBackend = backend
 
-def save_record(
-    record: dict[str, Any],
-    data_path: str | None = None,
-    *,
-    opt_in: Any = False,
-) -> dict[str, Any]:
-    """
-    Append one evaluated student record only if:
-      - opt_in is explicit consent, AND
-      - the record is a successful AI-processed result (not logic_fallback).
+    def describe(self) -> JSONObject:
+        """The backend type only; its location stays out of /health."""
+        return {"backend": type(self.__backend).__name__}
 
-    Default is no save. Adds saved_at (UTC ISO) and save_opt_in=True on the row.
-    Returns {"ok": bool, "error": str|None, "path": str, "record": dict|None}.
-    """
-    path = _resolve_path(data_path)
+    def save(self, record: Record, *, opt_in: bool) -> SaveResult:
+        """Append one record. Any kind of Record is saved the same way."""
+        if opt_in is not True:
+            return SaveResult(error=self.CONSENT_REQUIRED)
+        problem = record.problem()
+        if problem:
+            return SaveResult(error=problem)
+        row = self.__stamped(record, record.record_id or uuid.uuid4().hex)
+        return self.__write(row, lambda: self.__backend.append(row))
 
-    if not _is_opted_in(opt_in):
-        return {
-            "ok": False,
-            "error": "Save refused: student opt-in required (pass opt_in=True).",
-            "path": str(path),
-            "record": None,
-        }
+    def replace_pending_record(self, record_id: str, record: CheckInRecord,
+                               *, opt_in: bool) -> SaveResult:
+        """Upgrade a pending row to its finished result, keeping its id.
 
-    if not isinstance(record, dict):
-        return {
-            "ok": False,
-            "error": "record must be a dict",
-            "path": str(path),
-            "record": None,
-        }
+        When no row has that id yet, the finished record is appended.
+        """
+        clean_id = record_id.strip()
+        if not clean_id:
+            return SaveResult(error="record_id is required")
+        if opt_in is not True:
+            return SaveResult(error=self.CONSENT_REQUIRED)
+        problem = record.problem()
+        if problem:
+            return SaveResult(error=problem)
+        row = self.__stamped(record, clean_id)
+        return self.__write(
+            row, lambda: self.__backend.replace(clean_id, row))
 
-    ai_err = _ai_success_error(record)
-    if ai_err is not None:
-        return {
-            "ok": False,
-            "error": ai_err,
-            "path": str(path),
-            "record": None,
-        }
+    def load(self) -> list[Record]:
+        """Every saved record. [] when nothing has been saved yet.
 
-    ok, records, load_error = _read_records_file(path)
-    if not ok:
-        return {"ok": False, "error": load_error, "path": str(path), "record": None}
+        Raises StorageError when the store is corrupt or unreadable, so a
+        broken file is never mistaken for an empty history.
+        """
+        return [self.__to_record(row) for row in self.__backend.load()]
 
-    # Soft load errors (corrupt) still allow overwrite-with-append of a fresh valid list
-    # so the app can recover; start from empty if previous content was unusable.
-    if load_error and "Corrupted" in load_error:
-        records = []
+    def query(self, wanted: Callable[[Record], bool]) -> list[Record]:
+        """The saved records for which wanted(record) is True."""
+        return [record for record in self.load() if wanted(record)]
 
-    stored = dict(record)
-    stored["save_opt_in"] = True
-    if "saved_at" not in stored or not stored.get("saved_at"):
-        stored["saved_at"] = datetime.now(timezone.utc).isoformat()
+    def history_for(self, student_id: str,
+                    survey_version: str) -> StressHistory:
+        """One student's check-ins on this questionnaire, and nobody else's.
 
-    records.append(stored)
-    write_ok, write_error = _write_records_file(path, records)
-    if not write_ok:
-        return {"ok": False, "error": write_error, "path": str(path), "record": None}
-
-    return {"ok": True, "error": None, "path": str(path), "record": stored}
-
-
-def filter_records(records: list[dict[str, Any]], **filters: Any) -> list[dict[str, Any]]:
-    """
-    Pure in-memory filter. Supported keys:
-      soft_label, intervention_tier / tier, student_id, risk_category,
-      cohort_year (2-digit student_id prefix)
-    Unknown keys are ignored. Missing fields on a record do not match.
-    """
-    if not isinstance(records, list):
-        return []
-
-    soft_label = filters.get("soft_label")
-    tier = filters.get("intervention_tier", filters.get("tier"))
-    student_id = filters.get("student_id")
-    risk_category = filters.get("risk_category")
-    cohort_year = filters.get("cohort_year")
-
-    out: list[dict[str, Any]] = []
-    for rec in records:
-        if not isinstance(rec, dict):
-            continue
-        if soft_label is not None:
-            if str(rec.get("soft_label", "")) != str(soft_label):
+        Only an exact Student ID match counts. Raises StorageError when
+        the store cannot be read.
+        """
+        finished: list[CheckInRecord] = []
+        pending = 0
+        for row in self.__backend.load():
+            record = self.__to_record(row)
+            if (not record.belongs_to(student_id)
+                    or record.survey_version != survey_version):
                 continue
-        if tier is not None:
-            rec_tier = rec.get("intervention_tier", rec.get("tier"))
-            try:
-                if int(rec_tier) != int(tier):
-                    continue
-            except (TypeError, ValueError):
+            if self.__is_pending(row):
+                pending += 1
+            else:
+                finished.append(CheckInRecord(row))
+        return StressHistory(student_id.strip(), finished, pending)
+
+    def filter_records(self, records: list[Record], tier: str = "",
+                       cohort_year: str = "",
+                       id_contains: str = "") -> list[Record]:
+        """Admin filters: tier label, cohort year and part of an ID."""
+        category = self.TIER_TO_CATEGORY.get(tier)
+        prefix = cohort_year.zfill(2)[-2:] if cohort_year else ""
+        kept: list[Record] = []
+        for record in records:
+            in_tier = (record.get("soft_label") == tier
+                       or record.get("risk_category") == category)
+            if tier and not in_tier:
                 continue
-        if student_id is not None:
-            if str(rec.get("student_id", "")) != str(student_id):
+            if prefix and record.student_id[:2] != prefix:
                 continue
-        if risk_category is not None:
-            if str(rec.get("risk_category", "")).lower() != str(risk_category).lower():
+            if id_contains not in record.student_id:
                 continue
-        if cohort_year is not None:
-            prefix = str(cohort_year).zfill(2)[-2:]
-            sid = str(rec.get("student_id", ""))
-            if len(sid) < 2 or sid[:2] != prefix:
-                continue
-        out.append(rec)
-    return out
+            kept.append(record)
+        return kept
 
+    def cohorts(self, records: list[Record]) -> list[str]:
+        """Two-digit cohort years (first two ID digits), newest first."""
+        years = {record.student_id[:2] for record in records}
+        return sorted((year for year in years
+                       if len(year) == 2 and year.isascii()
+                       and year.isdigit()), reverse=True)
 
-def get_records_by_tier(tier: int, data_path: str | None = None) -> list[dict[str, Any]]:
-    loaded = load_all_records(data_path)
-    return filter_records(loaded["records"], intervention_tier=tier)
+    def __stamped(self, record: Record, record_id: str) -> JSONObject:
+        row = record.to_row()
+        row["record_id"] = record_id
+        row["save_opt_in"] = True
+        if not row.get("saved_at"):
+            row["saved_at"] = datetime.now(timezone.utc).isoformat()
+        return row
 
+    def __write(self, row: JSONObject,
+                action: Callable[[], None]) -> SaveResult:
+        try:
+            action()
+        except StorageError as error:
+            self.logger.warning("Saving a record failed: %s", error)
+            return SaveResult(error=str(error))
+        return SaveResult(row=row)
 
-def get_records_by_soft_label(
-    soft_label: str, data_path: str | None = None
-) -> list[dict[str, Any]]:
-    loaded = load_all_records(data_path)
-    return filter_records(loaded["records"], soft_label=soft_label)
+    def __to_record(self, row: JSONObject) -> Record:
+        """Rebuild the right kind of Record from a stored row."""
+        if self.__is_pending(row):
+            return PendingRecord(row)
+        return CheckInRecord(row)
 
-
-def get_record_by_student_id(
-    student_id: str, data_path: str | None = None
-) -> list[dict[str, Any]]:
-    """All historical rows for one student ID."""
-    loaded = load_all_records(data_path)
-    return filter_records(loaded["records"], student_id=student_id)
-
-
-def get_records_by_risk_category(
-    category: str, data_path: str | None = None
-) -> list[dict[str, Any]]:
-    loaded = load_all_records(data_path)
-    return filter_records(loaded["records"], risk_category=category)
-
-
-def get_records_by_cohort_year(
-    year_prefix: str, data_path: str | None = None
-) -> list[dict[str, Any]]:
-    """Filter by student_id year prefix (e.g. '26' for 2026 intake)."""
-    loaded = load_all_records(data_path)
-    return filter_records(loaded["records"], cohort_year=year_prefix)
+    def __is_pending(self, row: JSONObject) -> bool:
+        """Marked pending, or never successfully processed by the AI."""
+        pending = str(row.get("status") or "").strip().lower() == "pending"
+        source = str(row.get("source") or "").strip().lower()
+        processed = (row.get("ai_ok") is True
+                     or source in CheckInRecord.AI_SUCCESS_SOURCES)
+        return pending or not processed

@@ -1,774 +1,180 @@
-"""I/O Manager for DoNotStress — student-facing Flask input layer.
+"""DoNotStress — I/O Layer (io_manager).
 
-Audience is students via a local Flask web UI (not advisors). This module
-owns pure-function validators and template formatters only.
+IOManager validates what students type into the web form and turns
+records into the plain data each page shows. All wording and page shapes
+live here and in the templates; no other layer writes student-facing
+copy.
 
-Joe's Flask app should import FORM_FIELDS / validate_student_form /
-format_* helpers (including format_ai_unavailable_error / format_ai_error
-when Gemini cannot complete a check-in). Do not put Gemini, Intervention
-Tier rules, or file I/O here. Functions only — no object types defined
-in this module.
-
-Canonical Flask form field names (request.form keys) — use FORM_FIELDS:
-  student_id          required  str   2-digit year in {23,24,25,26} + 5 digits
-  sleep_hours         required  float 0.0–24.0 inclusive, 0.5-hour steps
-  stress_level        required  int   1–10 inclusive
-  academic_workload   required  int   1–10 inclusive
-  financial_stress    required  int   1–10 inclusive (scale, not yes/no)
-  social_support      required  int   1–10 inclusive
-  feelings_text       optional  str   blank allowed
-                                      prompt: "In your own words, how have you
-                                      been feeling about school lately?"
-
-Removed from this public API (do not collect):
-  submission_rate, cca_count, consecutive_absences, free_text_concern,
-  and the old financial_stress yes/no bool.
-
-Validators are pure: validate_X(raw) -> (ok, value_or_error_message).
-Web entry point: validate_student_form(form_dict) -> (ok, record_or_errors).
-A thin CLI collect_student_record() remains for smoke tests only.
+Student ID: seven ASCII digits beginning with 2. The reflection is checked
+for crisis language and then discarded; only the safety flag remains.
 """
 
-# ---------------------------------------------------------------------------
-# Form field names for Flask coordination
-# ---------------------------------------------------------------------------
+from __future__ import annotations
 
-FORM_FIELDS = {
-    "student_id": "student_id",
-    "sleep_hours": "sleep_hours",
-    "stress_level": "stress_level",
-    "academic_workload": "academic_workload",
-    "financial_stress": "financial_stress",
-    "social_support": "social_support",
-    "feelings_text": "feelings_text",
-}
+from collections.abc import Mapping, Sequence
 
-FORM_PROMPTS = {
-    "student_id": "Student ID",
-    "sleep_hours": "How many hours of sleep did you get last night?",
-    "stress_level": "How stressed have you been feeling? (1–10)",
-    "academic_workload": "How heavy has your academic workload felt? (1–10)",
-    "financial_stress": "How stressed have you been about money? (1–10)",
-    "social_support": "How supported have you felt by people around you? (1–10)",
-    "feelings_text": (
-        "In your own words, how have you been feeling about school lately?"
-    ),
-}
-
-RECORD_FIELD_ORDER = (
-    "student_id",
-    "sleep_hours",
-    "stress_level",
-    "academic_workload",
-    "financial_stress",
-    "social_support",
-    "feelings_text",
-)
-
-REQUIRED_FORM_FIELDS = (
-    "student_id",
-    "sleep_hours",
-    "stress_level",
-    "academic_workload",
-    "financial_stress",
-    "social_support",
-)
-
-# ---------------------------------------------------------------------------
-# Validation constants
-# ---------------------------------------------------------------------------
-
-VALID_STUDENT_ID_YEARS = ("23", "24", "25", "26")
-STUDENT_ID_EXAMPLE = "2605581"
-STUDENT_ID_SERIAL_DIGITS = 5
-
-SLEEP_HOURS_MIN = 0.0
-SLEEP_HOURS_MAX = 24.0
-SLEEP_HOURS_STEP = 0.5
-
-SCALE_MIN = 1
-SCALE_MAX = 10
-
-# ---------------------------------------------------------------------------
-# Soft labels, tips allow-list, advisor contacts (hardcoded — never invent)
-# ---------------------------------------------------------------------------
-
-SOFT_LABELS = (
-    "You're doing ok",
-    "Worth a check-in",
-    "Please reach out",
-)
-
-SOFT_LABEL_COPY = {
-    "You're doing ok": {
-        "label": "You're doing ok",
-        "heading": "You're doing ok",
-        "body": "Your check-in looks steady. Keep looking after yourself.",
-        "tone": "reassuring",
-    },
-    "Worth a check-in": {
-        "label": "Worth a check-in",
-        "heading": "Worth a check-in",
-        "body": (
-            "Some things look a bit heavier right now. "
-            "A conversation could help."
-        ),
-        "tone": "supportive",
-    },
-    "Please reach out": {
-        "label": "Please reach out",
-        "heading": "Please reach out",
-        "body": (
-            "Please reach out for support. "
-            "You do not have to handle this on your own."
-        ),
-        "tone": "urgent",
-    },
-}
-
-# Tip IDs that templates / other layers may pass into format_tips.
-# Copy is student-facing. Do not add phone numbers or extra emails here.
-TIPS_ALLOWLIST = {
-    "sleep_routine": (
-        "Try to keep a regular sleep schedule, including on weekends."
-    ),
-    "rest_a_little_more": (
-        "If you can, give yourself a bit more rest — even 30 extra minutes "
-        "can help."
-    ),
-    "short_breaks": (
-        "Take short, planned breaks between study blocks instead of pushing "
-        "through without a pause."
-    ),
-    "workload_chunks": (
-        "Break larger assignments into smaller tasks and spread them across "
-        "the week."
-    ),
-    "money_worries": (
-        "If money is on your mind, campus support can help you find the "
-        "right next step."
-    ),
-    "talk_to_someone": (
-        "Reach out to a friend, classmate, or family member — you do not "
-        "have to handle this alone."
-    ),
-    "keep_social_contact": (
-        "Stay in touch with people who help you feel supported, even with "
-        "a short check-in."
-    ),
-    "feelings_check_in": (
-        "Name how you have been feeling and give yourself permission to "
-        "ask for help if school feels heavy."
-    ),
-}
-
-SPEAK_PROMINENCE = ("low", "medium", "high")
-
-# Real contacts only. Model / callers must never invent others.
-ADVISOR_EMAIL = "SITCounselling@SingaporeTech.edu.sg"
-ADVISOR_HELPLINE = "6592 2030"
-ADVISOR_MAILTO = "mailto:SITCounselling@SingaporeTech.edu.sg"
-
-ADVISOR_CONTACTS = {
-    "email": ADVISOR_EMAIL,
-    "helpline": ADVISOR_HELPLINE,
-    "mailto": ADVISOR_MAILTO,
-}
-
-SPEAK_PANEL_COPY = {
-    "low": {
-        "heading": "Support is available",
-        "body": (
-            "If you would like to talk, you can contact SIT Counselling."
-        ),
-        "cta": "Optional: get in touch",
-    },
-    "medium": {
-        "heading": "Consider speaking with someone",
-        "body": (
-            "It may help to talk with SIT Counselling about how you have "
-            "been feeling."
-        ),
-        "cta": "Reach out when you are ready",
-    },
-    "high": {
-        "heading": "Please reach out",
-        "body": (
-            "Please contact SIT Counselling. You do not have to handle "
-            "this on your own."
-        ),
-        "cta": "Contact support now",
-    },
-}
-
-# Gemini is mandatory for every check-in result. These formatters exist so
-# Flask can show a hard-stop error page — not a logic-only / tips happy path.
-AI_UNAVAILABLE_HEADING = "We couldn't complete your check-in"
-AI_UNAVAILABLE_BODY = (
-    "This check-in needs Gemini AI before we can show a result. "
-    "AI is required for every record, so we cannot finish your check-in "
-    "right now. Please try again later."
-)
-AI_UNAVAILABLE_ACTION_LABEL = "Try again"
-AI_UNAVAILABLE_TONE = "urgent"
-AI_REQUIRED_HINT = (
-    "Operators/dev: Gemini AI is required for every check-in. Confirm "
-    "GEMINI_API_KEY is set in the environment. Do not share or display the key."
-)
-
-AI_ERROR_CODES = (
-    "missing_api_key",
-    "timeout",
-    "invalid_response",
-    "retries_exhausted",
-    "unavailable",
-)
-
-AI_ERROR_HINTS = {
-    "missing_api_key": (
-        "Operators/dev: GEMINI_API_KEY is not set. Add it to the environment "
-        "and restart the app. Never paste the key into the page or into "
-        "student-facing copy."
-    ),
-    "timeout": (
-        "Operators/dev: the Gemini request timed out. Confirm GEMINI_API_KEY "
-        "is set and the service is reachable, then try again. Do not share "
-        "the key."
-    ),
-    "invalid_response": (
-        "Operators/dev: Gemini returned a response that could not be used. "
-        "Confirm GEMINI_API_KEY is set and check server logs. Do not expose "
-        "the key."
-    ),
-    "retries_exhausted": (
-        "Operators/dev: Gemini failed after retries. Confirm GEMINI_API_KEY "
-        "is set and the service is reachable. Do not expose the key."
-    ),
-    "unavailable": AI_REQUIRED_HINT,
-}
+from base_manager import BaseManager
+from json_types import JSONObject
+from logic.trend import Trend
+from questions.questionnaire import Questionnaire
+from records.record import Record
+from records.stress_history import StressHistory
+from views.admin_records_view import AdminRecordsView
+from views.history_entry_view import HistoryEntryView
+from views.student_copy import StudentCopy
+from views.student_result_view import StudentResultView
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers (pure)
-# ---------------------------------------------------------------------------
+class IOManager(BaseManager):
+    """Collects and validates input; renders results, lists and errors.
 
-def _as_text(raw) -> str:
-    """Normalize raw input to a stripped string. None becomes empty."""
-    if raw is None:
-        return ""
-    return str(raw).strip()
+    The questionnaire is passed in and shared (aggregation). The wording
+    and the page views are created here and belong to this manager
+    (composition).
+    """
 
+    STUDENT_ID_EXAMPLE: str = "2605581"
+    REFLECTION_LIMIT: int = 2000
 
-def _looks_like_int(text: str) -> bool:
-    """True when text is a base-10 integer (optional leading + or -)."""
-    if not text:
-        return False
-    if text[0] in "+-":
-        return len(text) > 1 and text[1:].isdigit()
-    return text.isdigit()
+    def __init__(self, questionnaire: Questionnaire) -> None:
+        super().__init__("io_manager")
+        self.__questionnaire: Questionnaire = questionnaire
+        self.__copy: StudentCopy = StudentCopy()
+        self.__result_view: StudentResultView = StudentResultView(
+            self.__copy, questionnaire)
+        self.__admin_view: AdminRecordsView = AdminRecordsView()
+        self.__history_view: HistoryEntryView = HistoryEntryView()
 
+    @property
+    def copy(self) -> StudentCopy:
+        """The allow-listed student-facing wording."""
+        return self.__copy
 
-def _parse_int(raw) -> tuple[bool, int | str]:
-    text = _as_text(raw)
-    if not _looks_like_int(text):
-        return False, "must be a whole number (integer)"
-    return True, int(text)
+    def describe(self) -> JSONObject:
+        return {"questionnaire": self.__questionnaire.version,
+                "questions": len(self.__questionnaire.questions)}
 
+    # --- Input -----------------------------------------------------------
 
-def _parse_float(raw) -> tuple[bool, float | str]:
-    text = _as_text(raw)
-    if text == "":
-        return False, "must be a number"
-    lowered = text.lower()
-    if lowered in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
-        return False, "must be a finite number"
-    try:
-        value = float(text)
-    except ValueError:
-        return False, "must be a number"
-    if value != value:  # NaN
-        return False, "must be a finite number"
-    if value == float("inf") or value == float("-inf"):
-        return False, "must be a finite number"
-    return True, value
+    def validate_student_id(self, raw: object) -> tuple[bool, str]:
+        """(True, the ID) or (False, a message). Seven digits from 2."""
+        text = str(raw if raw is not None else "").strip()
+        if (len(text) != 7 or not text.isascii() or not text.isdigit()
+                or not text.startswith("2")):
+            return False, ("Student ID must be exactly 7 digits and start "
+                           f"with 2 (e.g. {self.STUDENT_ID_EXAMPLE}).")
+        return True, text
 
+    def validate_feelings_text(self, raw: object) -> tuple[bool, str]:
+        """(True, the stripped reflection) or (False, a message)."""
+        if raw is not None and not isinstance(raw, str):
+            return False, "Please enter text or leave this blank."
+        text = (raw or "").strip()
+        if len(text) > self.REFLECTION_LIMIT:
+            return False, ("Please keep your reflection within 2,000 "
+                           "characters.")
+        return True, text
 
-def _is_half_hour_step(value: float) -> bool:
-    """True when value is a multiple of 0.5 (within a tiny float tolerance)."""
-    steps = value / SLEEP_HOURS_STEP
-    return abs(steps - round(steps)) <= 1e-9
+    def validate_student_form(self, form: Mapping[str, object]
+                              ) -> tuple[bool, JSONObject]:
+        """(True, the check-in) or (False, a message for each bad field).
 
+        The check-in never keeps the reflection, and never trusts a score,
+        tier or flag sent by the browser.
+        """
+        record: JSONObject = {}
+        errors: JSONObject = {}
+        ok, student_id = self.validate_student_id(form.get("student_id"))
+        (record if ok else errors)["student_id"] = student_id
+        for question in self.__questionnaire.questions:
+            ok, answer = question.validate(form.get(question.key))
+            (record if ok else errors)[question.key] = answer
+        ok, reflection = self.validate_feelings_text(
+            form.get("feelings_text"))
+        if not ok:
+            errors["feelings_text"] = reflection
+        if errors:
+            return False, errors
+        record["safety_flag"] = self.__questionnaire.safety.fired(reflection)
+        record["survey_version"] = self.__questionnaire.version
+        return True, record
 
-def _quantize_half_hour(value: float) -> float:
-    return round(value / SLEEP_HOURS_STEP) * SLEEP_HOURS_STEP
-
-
-def _validate_scale_1_to_10(raw, field_label: str) -> tuple[bool, int | str]:
-    ok, parsed = _parse_int(raw)
-    if not ok:
-        return False, f"{field_label} {parsed}."
-    if parsed < SCALE_MIN or parsed > SCALE_MAX:
-        return False, (
-            f"{field_label} must be an integer between {SCALE_MIN} and "
-            f"{SCALE_MAX} (inclusive)."
-        )
-    return True, parsed
-
-
-def _form_get(form_dict, key: str):
-    """Read one key from a Flask request.form-like mapping."""
-    if form_dict is None:
-        return ""
-    getter = getattr(form_dict, "get", None)
-    if getter is None:
-        return ""
-    value = getter(key)
-    if value is None:
-        return ""
-    return value
-
-
-def _looks_like_secret(text: str) -> bool:
-    """True when operator text might contain a key or token — do not show it."""
-    if not text:
-        return False
-    compact = "".join(text.split())
-    lowered = compact.lower()
-    if "gemini_api_key=" in lowered or "api_key=" in lowered:
-        return True
-    if "bearer" in lowered and len(compact) > 20:
-        return True
-    # Long token-like strings (Google API keys are typically 39+ chars).
-    if len(compact) >= 32 and compact.isalnum():
-        return True
-    return False
-
-
-def _sanitize_operator_detail(raw) -> str | None:
-    """Keep a short operator note; drop anything that looks like a secret."""
-    text = _as_text(raw)
-    if not text:
+    def validate_record_filters(self, tier: str,
+                                cohort_year: str) -> str | None:
+        """A message for an unknown admin filter, or None when both are ok."""
+        if tier and tier not in self.__copy.SOFT_LABEL_COPY:
+            return ("Choose a tier: You're doing ok, Worth a check-in, or "
+                    "Please reach out.")
+        if cohort_year and (len(cohort_year) not in (2, 4)
+                            or not cohort_year.isascii()
+                            or not cohort_year.isdigit()):
+            return "Choose a valid cohort year."
         return None
-    if _looks_like_secret(text):
-        return None
-    if len(text) > 200:
-        text = text[:200].rstrip() + "…"
-    return text
 
+    def safety_fired(self, text: object) -> bool:
+        """The reflection safety check, for an immediate support prompt."""
+        return self.__questionnaire.safety.fired(text)
 
-# ---------------------------------------------------------------------------
-# Normalize helpers (Flask request.form strings)
-# ---------------------------------------------------------------------------
+    # --- Output ----------------------------------------------------------
 
-def normalize_form_value(raw) -> str:
-    """Strip a single form value. None becomes ''."""
-    return _as_text(raw)
+    def display_record(self, record: Record) -> JSONObject:
+        """The answers of one check-in as labelled values."""
+        fields: list[JSONObject] = []
+        if record.student_id:
+            fields.append({"key": "student_id", "label": "Student ID",
+                           "value": record.student_id})
+        for question in self.__questionnaire.questions:
+            value = record.get(question.key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            shown = f"{value:g}"
+            if question.options:
+                shown = f"{shown} · {question.option_label(int(value))}"
+            elif question.step < 1:
+                shown = f"{value:.1f}"
+            fields.append({"key": question.key, "label": question.prompt,
+                           "value": shown})
+        return {"heading": "Your check-in", "fields": fields,
+                "empty": not fields}
 
+    def display_list(self, records: Sequence[Record]) -> list[JSONObject]:
+        """Admin table rows, newest first."""
+        newest = sorted(records, key=lambda record: record.saved_at,
+                        reverse=True)
+        return self.__admin_view.render_many(newest)
 
-def extract_form_fields(form_dict) -> dict:
-    """Return only the canonical FORM_FIELDS keys from a form mapping."""
-    return {key: normalize_form_value(_form_get(form_dict, key)) for key in FORM_FIELDS}
+    def display_result(self, record: Record) -> JSONObject:
+        """The student's result page for a finished check-in."""
+        return self.__result_view.render(record)
 
+    def display_history(self, history: StressHistory,
+                        trend: Trend) -> JSONObject:
+        """A student's own history page: scores, trend and support.
 
-# ---------------------------------------------------------------------------
-# Validators — validate_X(raw) -> (ok, value_or_error)
-# ---------------------------------------------------------------------------
-
-def validate_student_id(raw) -> tuple[bool, str]:
-    """Require a 2-digit year in {23,24,25,26} followed by 5 digits."""
-    text = _as_text(raw)
-    if not text:
-        return False, (
-            "Student ID is required. Use a 2-digit year (23, 24, 25, or 26) "
-            f"followed by 5 digits (e.g. {STUDENT_ID_EXAMPLE})."
-        )
-    if not text.isdigit() or len(text) != 2 + STUDENT_ID_SERIAL_DIGITS:
-        return False, (
-            "Student ID must be 7 digits: a 2-digit year (23, 24, 25, or 26) "
-            f"followed by 5 digits (e.g. {STUDENT_ID_EXAMPLE})."
-        )
-    year = text[:2]
-    if year not in VALID_STUDENT_ID_YEARS:
-        allowed = ", ".join(VALID_STUDENT_ID_YEARS)
-        return False, f"Student ID year '{year}' is not allowed. Use one of: {allowed}."
-    return True, text
-
-
-def validate_sleep_hours(raw) -> tuple[bool, float | str]:
-    """Require a float in [0.0, 24.0] on 0.5-hour steps (5.0, 5.5, 6.0)."""
-    ok, parsed = _parse_float(raw)
-    if not ok:
-        return False, f"Sleep hours {parsed}."
-    if parsed < SLEEP_HOURS_MIN or parsed > SLEEP_HOURS_MAX:
-        return False, (
-            f"Sleep hours must be between {SLEEP_HOURS_MIN:.1f} and "
-            f"{SLEEP_HOURS_MAX:.1f} (inclusive), in {SLEEP_HOURS_STEP}-hour "
-            "steps (e.g. 5.0, 5.5, 6.0)."
-        )
-    if not _is_half_hour_step(parsed):
-        return False, (
-            "Sleep hours must be in 0.5-hour steps "
-            "(e.g. 5.0, 5.5, 6.0). Values like 5.25 are not allowed."
-        )
-    return True, _quantize_half_hour(parsed)
-
-
-def validate_stress_level(raw) -> tuple[bool, int | str]:
-    """Require an integer in [1, 10]."""
-    return _validate_scale_1_to_10(raw, "Stress level")
-
-
-def validate_academic_workload(raw) -> tuple[bool, int | str]:
-    """Require an integer in [1, 10]."""
-    return _validate_scale_1_to_10(raw, "Academic workload")
-
-
-def validate_financial_stress(raw) -> tuple[bool, int | str]:
-    """Require an integer in [1, 10] (scale, not yes/no)."""
-    return _validate_scale_1_to_10(raw, "Financial stress")
-
-
-def validate_social_support(raw) -> tuple[bool, int | str]:
-    """Require an integer in [1, 10]."""
-    return _validate_scale_1_to_10(raw, "Social support")
-
-
-def validate_feelings_text(raw) -> tuple[bool, str]:
-    """Optional free text. Blank or whitespace-only is stored as ''."""
-    return True, _as_text(raw)
-
-
-_FIELD_VALIDATORS = {
-    "student_id": validate_student_id,
-    "sleep_hours": validate_sleep_hours,
-    "stress_level": validate_stress_level,
-    "academic_workload": validate_academic_workload,
-    "financial_stress": validate_financial_stress,
-    "social_support": validate_social_support,
-    "feelings_text": validate_feelings_text,
-}
-
-
-def validate_student_form(form_dict) -> tuple[bool, dict]:
-    """Validate every student field from a Flask request.form-like mapping.
-
-    Returns (True, record) when all fields are valid.
-    Returns (False, errors) when any required field fails. `errors` maps
-    field name -> error message. All fields are checked (not fail-fast).
-
-    `form_dict` may be a dict, Flask ImmutableMultiDict, or any object
-    with .get(key). Missing keys are treated as blank strings.
-    """
-    record = {}
-    errors = {}
-    for key in RECORD_FIELD_ORDER:
-        raw = _form_get(form_dict, key)
-        ok, result = _FIELD_VALIDATORS[key](raw)
-        if ok:
-            record[key] = result
-        else:
-            errors[key] = result
-    if errors:
-        return False, errors
-    return True, record
-
-
-def collect_student_record_from_form(form_dict) -> tuple[bool, dict]:
-    """Alias of validate_student_form for Flask call sites."""
-    return validate_student_form(form_dict)
-
-
-# ---------------------------------------------------------------------------
-# Formatters for web templates — strings / plain dicts of copy; no print
-# ---------------------------------------------------------------------------
-
-def format_soft_label(soft_label) -> dict:
-    """Return template copy for a soft label.
-
-    soft_label must be one of SOFT_LABELS:
-      "You're doing ok" | "Worth a check-in" | "Please reach out"
-    """
-    text = _as_text(soft_label)
-    copy = SOFT_LABEL_COPY.get(text)
-    if copy is None:
-        allowed = ", ".join(f'"{label}"' for label in SOFT_LABELS)
+        Support is highlighted when stress is building or the latest
+        check-in was High. Answers and reasoning are never included.
+        """
+        latest = history.latest
+        high = latest is not None and latest.risk_category == "High"
+        needs_support = high or trend.direction == Trend.BUILDING
+        advisor = (self.__copy.advisor_panel("high" if high else "medium")
+                   if needs_support else None)
         return {
-            "label": "",
-            "heading": "",
-            "body": "",
-            "tone": "",
-            "error": f"Unknown soft label. Use one of: {allowed}.",
+            "student_id": history.student_id,
+            "entries": self.__history_view.render_many(history.records),
+            "pending": history.pending_count,
+            "trend": self.__copy.trend_summary(trend),
+            "advisor": advisor,
         }
-    return {
-        "label": copy["label"],
-        "heading": copy["heading"],
-        "body": copy["body"],
-        "tone": copy["tone"],
-        "error": None,
-    }
 
+    def display_error(self, code: str,
+                      detail: str | None = None) -> JSONObject:
+        """The page shown when the AI step could not finish."""
+        return self.__copy.ai_error(code, detail)
 
-def format_tips(tips) -> dict:
-    """Return template copy for an allow-listed tip list.
+    def advisor_panel(self, prominence: str) -> JSONObject:
+        return self.__copy.advisor_panel(prominence)
 
-    `tips` is a list of tip IDs (preferred) or exact allow-list strings.
-    Unknown tips are dropped — this formatter never invents copy.
-    Duplicates keep the first occurrence only.
-    """
-    items = []
-    seen = set()
-    if tips is None:
-        tips = []
-    for raw in tips:
-        text = _as_text(raw)
-        if not text or text in seen:
-            continue
-        tip_id = None
-        tip_text = None
-        if text in TIPS_ALLOWLIST:
-            tip_id = text
-            tip_text = TIPS_ALLOWLIST[text]
-        else:
-            for known_id, known_text in TIPS_ALLOWLIST.items():
-                if text == known_text:
-                    tip_id = known_id
-                    tip_text = known_text
-                    break
-        if tip_id is None:
-            continue
-        seen.add(tip_id)
-        seen.add(tip_text)
-        items.append({"id": tip_id, "text": tip_text})
-    return {
-        "heading": "Suggestions for you",
-        "items": items,
-        "texts": [item["text"] for item in items],
-    }
-
-
-def format_speak_to_advisor_panel(speak_prominence) -> dict:
-    """Return the Speak-to-Advisor panel copy and hardcoded contacts.
-
-    speak_prominence is "low" | "medium" | "high" and changes tone only.
-    Contacts are always the same real values — never invented:
-      email    SITCounselling@SingaporeTech.edu.sg
-      helpline 6592 2030
-      mailto   mailto:SITCounselling@SingaporeTech.edu.sg
-
-    Unknown prominence still includes those contacts and uses medium copy.
-    """
-    prominence = _as_text(speak_prominence).lower()
-    copy = SPEAK_PANEL_COPY.get(prominence)
-    error = None
-    if copy is None:
-        prominence = "medium"
-        copy = SPEAK_PANEL_COPY["medium"]
-        allowed = ", ".join(SPEAK_PROMINENCE)
-        error = f"Unknown speak_prominence. Use one of: {allowed}."
-    return {
-        "prominence": prominence,
-        "heading": copy["heading"],
-        "body": copy["body"],
-        "cta": copy["cta"],
-        "email": ADVISOR_EMAIL,
-        "helpline": ADVISOR_HELPLINE,
-        "mailto": ADVISOR_MAILTO,
-        "contacts": {
-            "email": ADVISOR_EMAIL,
-            "helpline": ADVISOR_HELPLINE,
-            "mailto": ADVISOR_MAILTO,
-        },
-        "error": error,
-    }
-
-
-def _ai_failure_copy(error_code, detail=None) -> dict:
-    """Shared payload for AI-required failure pages (no soft-label happy path)."""
-    code = _as_text(error_code).lower()
-    unknown = False
-    if code not in AI_ERROR_CODES:
-        unknown = bool(code)
-        code = "unavailable"
-    if not code:
-        code = "unavailable"
-
-    body = AI_UNAVAILABLE_BODY
-    hint = AI_ERROR_HINTS[code]
-    reason = _sanitize_operator_detail(detail)
-    if reason:
-        hint = f"{hint} Detail: {reason}."
-
-    panel = format_speak_to_advisor_panel("high")
-    error = None
-    if unknown:
-        allowed = ", ".join(AI_ERROR_CODES)
-        error = f"Unknown AI error_code. Use one of: {allowed}."
-
-    return {
-        "heading": AI_UNAVAILABLE_HEADING,
-        "body": body,
-        "message": body,
-        "hint": hint,
-        "action_label": AI_UNAVAILABLE_ACTION_LABEL,
-        "tone": AI_UNAVAILABLE_TONE,
-        "ai_required": True,
-        "error_code": code,
-        "reason": reason,
-        "speak_to_advisor": panel,
-        "email": ADVISOR_EMAIL,
-        "helpline": ADVISOR_HELPLINE,
-        "mailto": ADVISOR_MAILTO,
-        "contacts": {
-            "email": ADVISOR_EMAIL,
-            "helpline": ADVISOR_HELPLINE,
-            "mailto": ADVISOR_MAILTO,
-        },
-        "error": error,
-    }
-
-
-def format_ai_unavailable_error(reason=None) -> dict:
-    """Return template copy when Gemini is required but unavailable.
-
-    Plain dict for Flask error pages. Students are told AI is required and
-    to try again later. Operators get a GEMINI_API_KEY hint (no secrets).
-    Official SIT Counselling contacts stay visible via speak_to_advisor
-    (high prominence) — this is not a logic-only / tips happy path.
-    """
-    return _ai_failure_copy("unavailable", detail=reason)
-
-
-def format_ai_error(error_code, detail=None) -> dict:
-    """Map an AI failure code to the same student-facing error dict.
-
-    Known codes: missing_api_key, timeout, invalid_response,
-    retries_exhausted, unavailable. Unknown codes still return a valid
-    error page (unavailable copy + contacts) and set `error`.
-    """
-    return _ai_failure_copy(error_code, detail=detail)
-
-
-def format_student_record(record: dict) -> dict:
-    """Return a plain dict of labelled values for a confirmation template."""
-    if not record:
-        return {
-            "heading": "Your check-in",
-            "fields": [],
-            "empty": True,
-        }
-    fields = []
-    for key in RECORD_FIELD_ORDER:
-        if key not in record:
-            continue
-        value = record[key]
-        if key == "feelings_text":
-            display = str(value).strip() if value is not None else ""
-            if not display:
-                display = "(skipped)"
-        elif key == "sleep_hours":
-            display = f"{float(value):.1f}"
-        else:
-            display = str(value)
-        fields.append({
-            "key": key,
-            "label": FORM_PROMPTS[key],
-            "value": display,
-        })
-    return {
-        "heading": "Your check-in",
-        "fields": fields,
-        "empty": len(fields) == 0,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Thin CLI helper — smoke tests only; field names match the web form
-# ---------------------------------------------------------------------------
-
-def print_message(message: str) -> None:
-    print(message)
-
-
-def print_error(message: str) -> None:
-    print(f"Error: {message}")
-
-
-def _prompt_until_valid(prompt: str, validator):
-    """Read a line, validate, and re-prompt with the error until valid."""
-    while True:
-        raw = input(prompt)
-        ok, result = validator(raw)
-        if ok:
-            return result
-        print_error(result)
-
-
-def get_student_id() -> str:
-    return _prompt_until_valid(
-        "Student ID (YYxxxxx, year 23-26, e.g. 2605581): ",
-        validate_student_id,
-    )
-
-
-def get_sleep_hours() -> float:
-    return _prompt_until_valid(
-        "Sleep hours last night (0.0 to 24.0, in 0.5 steps): ",
-        validate_sleep_hours,
-    )
-
-
-def get_stress_level() -> int:
-    return _prompt_until_valid(
-        "Stress level (1 to 10): ",
-        validate_stress_level,
-    )
-
-
-def get_academic_workload() -> int:
-    return _prompt_until_valid(
-        "Academic workload (1 to 10): ",
-        validate_academic_workload,
-    )
-
-
-def get_financial_stress() -> int:
-    return _prompt_until_valid(
-        "Financial stress (1 to 10): ",
-        validate_financial_stress,
-    )
-
-
-def get_social_support() -> int:
-    return _prompt_until_valid(
-        "Social support (1 to 10): ",
-        validate_social_support,
-    )
-
-
-def get_feelings_text() -> str:
-    return _prompt_until_valid(
-        "In your own words, how have you been feeling about school lately? "
-        "(optional, press Enter to skip): ",
-        validate_feelings_text,
-    )
-
-
-def collect_student_record() -> dict:
-    """Prompt for every web-aligned field (CLI smoke test only)."""
-    print_message("Student wellbeing check-in.")
-    print_message("Invalid values will be rejected until a valid value is entered.")
-    return {
-        "student_id": get_student_id(),
-        "sleep_hours": get_sleep_hours(),
-        "stress_level": get_stress_level(),
-        "academic_workload": get_academic_workload(),
-        "financial_stress": get_financial_stress(),
-        "social_support": get_social_support(),
-        "feelings_text": get_feelings_text(),
-    }
-
-
-if __name__ == "__main__":
-    demo = collect_student_record()
-    print_message("")
-    print_message(str(format_student_record(demo)))
+    def page_config(self) -> JSONObject:
+        """The questionnaire as the browser needs it."""
+        return self.__questionnaire.public_config()

@@ -1,580 +1,343 @@
-"""
-DoNotStress — AI Processing Layer (ai_manager)
+"""DoNotStress — AI Processing Layer (ai_manager).
 
-Sole owner of Gemini prompt construction, structured JSON API calls,
-schema validation, and graceful retries.
+AIManager is the only class that talks to an AI provider. For every
+check-in it builds the prompt, calls the provider with model fallback,
+parses the reply and validates it field by field.
 
-Audience: students (local Flask web UI), not advisors.
-Gemini is MANDATORY: every record must pass through analyse_student /
-call_gemini. This layer never invents soft_label / tips / speak_prominence
-as a substitute product, and never falls back to logic_manager.
+It holds no domain rules. The scoring instructions and the check on each
+reply come from a ScoreAuditor (the Logic layer's StressScorer). A reply
+that fails that check is treated like any other invalid reply.
 
-Pure procedural Python: functions only.
-No terminal I/O (print / input), no Intervention Tier rules, no file persistence.
+Only the 11 raw answers, the questionnaire version and the question
+wording are sent: never a student id, reflection, or precomputed score,
+flag or tier. On failure it returns an AIFailure and never invents
+soft_label / tips / speak_prominence or falls back to Logic.
 
 Pipeline position:
-  User → io_manager → ai_manager (required) → data_manager
-  On failure: structured error for io_manager.format_ai_error (no Logic substitute)
+  User → io_manager → ai_manager (required) → logic_manager → data_manager
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import os
 import time
-from typing import Any, Callable
 
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# I/O fields this layer may send to Gemini (student check-in only)
-# ---------------------------------------------------------------------------
-
-STUDENT_PROMPT_FIELDS = (
-    "student_id",
-    "sleep_hours",
-    "stress_level",
-    "academic_workload",
-    "financial_stress",
-    "social_support",
-    "feelings_text",
-)
-
-# ---------------------------------------------------------------------------
-# Shared allow-lists — MUST match io_manager (PR #6) exactly.
-# logic_manager fallback MUST use the same IDs / strings.
-# Tip *copy* lives in io_manager.format_tips — this layer returns IDs only.
-# ---------------------------------------------------------------------------
-
-SOFT_LABEL_OK = "You're doing ok"
-SOFT_LABEL_CHECK_IN = "Worth a check-in"
-SOFT_LABEL_REACH_OUT = "Please reach out"
-SOFT_LABEL_OK_CURLY = "You’re doing ok"
-
-SOFT_LABELS = (
-    SOFT_LABEL_OK,
-    SOFT_LABEL_CHECK_IN,
-    SOFT_LABEL_REACH_OUT,
-)
-ALLOWED_SOFT_LABELS = frozenset(SOFT_LABELS)
-_SOFT_LABEL_ALIASES = {
-    SOFT_LABEL_OK: SOFT_LABEL_OK,
-    SOFT_LABEL_OK_CURLY: SOFT_LABEL_OK,
-    SOFT_LABEL_CHECK_IN: SOFT_LABEL_CHECK_IN,
-    SOFT_LABEL_REACH_OUT: SOFT_LABEL_REACH_OUT,
-}
-
-SPEAK_PROMINENCE = ("low", "medium", "high")
-ALLOWED_SPEAK_PROMINENCE = frozenset(SPEAK_PROMINENCE)
-ALLOWED_RISK_CATEGORIES = frozenset({"Low", "Moderate", "High"})
-
-ALLOWED_PRIMARY_STRESSORS = frozenset(
-    {
-        "sleep_deprivation",
-        "high_stress",
-        "academic_overload",
-        "financial_pressure",
-        "low_social_support",
-        "emotional_distress",
-    }
-)
-
-# IDs only — same keys as io_manager.TIPS_ALLOWLIST. Do not invent tip text.
-ALLOWED_TIP_IDS = frozenset(
-    {
-        "sleep_routine",
-        "rest_a_little_more",
-        "short_breaks",
-        "workload_chunks",
-        "money_worries",
-        "talk_to_someone",
-        "keep_social_contact",
-        "feelings_check_in",
-    }
-)
-
-_REQUIRED_FIELDS = (
-    "risk_score",
-    "risk_category",
-    "primary_stressors",
-    "recommended_support",
-    "confidence",
-    "reasoning",
-    "soft_label",
-    "tips",
-    "speak_prominence",
-)
-
-_DEFAULT_MODEL = "gemini-2.0-flash"
-_DEFAULT_MAX_ATTEMPTS = 3
-_DEFAULT_RETRY_DELAY_SEC = 0.5
-_TIPS_MIN = 1
-_TIPS_MAX = 3
-
-# ---------------------------------------------------------------------------
-# Structured AI failures — codes MUST match io_manager.format_ai_error
-# ---------------------------------------------------------------------------
-
-AI_SOURCE = "gemini"
-
-ERROR_CODE_MISSING_API_KEY = "missing_api_key"
-ERROR_CODE_TIMEOUT = "timeout"
-ERROR_CODE_INVALID_RESPONSE = "invalid_response"
-ERROR_CODE_RETRIES_EXHAUSTED = "retries_exhausted"
-ERROR_CODE_UNAVAILABLE = "unavailable"
-
-AI_ERROR_CODES = (
-    ERROR_CODE_MISSING_API_KEY,
-    ERROR_CODE_TIMEOUT,
-    ERROR_CODE_INVALID_RESPONSE,
-    ERROR_CODE_RETRIES_EXHAUSTED,
-    ERROR_CODE_UNAVAILABLE,
-)
-
-_TIMEOUT_MARKERS = (
-    "timeout",
-    "timed out",
-    "timed_out",
-    "deadlineexceeded",
-    "deadline exceeded",
-    "read timed out",
-)
-_SCHEMA_MARKERS = (
-    "schema validation",
-    "not valid json",
-    "jsondecodeerror",
-    "jsondecode",
-    "malformed",
-    "missing required fields",
-    "must be a json object",
-    "empty ai response",
-    "allow-list",
-    "invalid json",
-    "ai response must be",
-)
-_MISSING_KEY_MARKERS = (
-    "missing_api_key",
-    "gemini_api_key is not set",
-    "api key is not set",
-    "api_key is not set",
-)
+from ai.ai_failure import AIFailure
+from ai.ai_provider import AIProvider
+from ai.ai_result import AIResult
+from ai.error_classifier import ErrorClassifier
+from ai.score_auditor import ScoreAuditor
+from ai.validators.choice_validator import ChoiceValidator
+from ai.validators.confidence_validator import ConfidenceValidator
+from ai.validators.reasoning_validator import ReasoningValidator
+from ai.validators.response_validator import ResponseValidator
+from ai.validators.score_validator import ScoreValidator
+from ai.validators.scored_items_validator import ScoredItemsValidator
+from ai.validators.soft_label_validator import SoftLabelValidator
+from ai.validators.stressors_validator import StressorsValidator
+from ai.validators.tips_validator import TipsValidator
+from base_manager import BaseManager
+from json_types import JSONObject, JSONValue
+from questions.question import Question
 
 
-def classify_ai_error(exc_or_message: Any) -> str:
+class AIManager(BaseManager):
+    """Builds the prompt, calls the provider, parses and checks the reply.
+
+    The provider is passed in and shared (aggregation); the auditor is
+    only used, never owned (association). The validators and the error
+    classifier are created here and belong to this manager (composition).
     """
-    Map an exception or message to one of AI_ERROR_CODES.
 
-    Used by call_gemini and by Flask/I/O to pick format_ai_error copy.
-    Unknown inputs map to "unavailable" (never invent a product outcome).
-    """
-    if isinstance(exc_or_message, dict):
-        code = str(exc_or_message.get("error_code", "")).strip().lower()
-        if code in AI_ERROR_CODES:
-            return code
-        exc_or_message = exc_or_message.get("detail", "")
+    MAX_TOTAL_CALLS: int = 4  # Gemini calls one check-in may spend
+    TRIES_PER_MODEL: int = 2  # a timeout or bad reply gets one more try
+    REPEATABLE: tuple[str, ...] = (AIFailure.TIMEOUT,
+                                   AIFailure.INVALID_RESPONSE)
+    RISK_CATEGORIES: tuple[str, ...] = ("Low", "Moderate", "High")
+    SPEAK_PROMINENCE: tuple[str, ...] = ("low", "medium", "high")
+    SOURCE: str = "gemini"  # marks a record that passed AI processing
 
-    type_name = ""
-    if isinstance(exc_or_message, BaseException):
-        type_name = type(exc_or_message).__name__
-        text = str(exc_or_message)
-    elif exc_or_message is None:
-        text = ""
-    else:
-        text = str(exc_or_message)
+    def __init__(self, provider: AIProvider, questions: list[Question],
+                 auditor: ScoreAuditor | None = None, *,
+                 max_attempts: int = 3,
+                 retry_delay_sec: float = 0.5) -> None:
+        super().__init__("ai_manager")
+        self.__provider: AIProvider = provider
+        self.__questions: list[Question] = list(questions)
+        self.__auditor: ScoreAuditor | None = auditor
+        self.__tries_per_model: int = max(
+            1, min(max_attempts, self.TRIES_PER_MODEL))
+        self.__retry_delay_sec: float = max(0.0, retry_delay_sec)
+        self.__classifier: ErrorClassifier = ErrorClassifier()
+        self.__validators: list[ResponseValidator] = [
+            ScoredItemsValidator(self.answer_keys),
+            ScoreValidator(),
+            ChoiceValidator(
+                "risk_category", self.RISK_CATEGORIES,
+                "The tier for stress_score, following the rules in the "
+                "prompt."),
+            SoftLabelValidator(),
+            ChoiceValidator(
+                "speak_prominence", self.SPEAK_PROMINENCE,
+                "Must match risk_category: low, medium, or high."),
+            StressorsValidator(),
+            TipsValidator(),
+            ReasoningValidator(),
+            ConfidenceValidator(),
+        ]
+        self.__schema: JSONObject = self.__build_schema()
 
-    combined = f"{type_name} {text}".strip().lower()
-    if not combined:
-        return ERROR_CODE_UNAVAILABLE
+    @property
+    def answer_keys(self) -> tuple[str, ...]:
+        return tuple(question.key for question in self.__questions)
 
-    if any(marker in combined for marker in _MISSING_KEY_MARKERS):
-        return ERROR_CODE_MISSING_API_KEY
-    if "gemini_api_key" in combined and (
-        "not set" in combined or "missing" in combined or "blank" in combined
-    ):
-        return ERROR_CODE_MISSING_API_KEY
+    @property
+    def prompt_fields(self) -> tuple[str, ...]:
+        """The only check-in fields ever sent to the provider."""
+        return self.answer_keys + ("survey_version",)
 
-    if any(marker in combined for marker in _TIMEOUT_MARKERS):
-        return ERROR_CODE_TIMEOUT
+    @property
+    def required_fields(self) -> tuple[str, ...]:
+        return tuple(validator.field for validator in self.__validators)
 
-    if any(marker in combined for marker in _SCHEMA_MARKERS):
-        return ERROR_CODE_INVALID_RESPONSE
+    @property
+    def response_schema(self) -> JSONObject:
+        """Gemini's structured-output schema, built from the validators."""
+        return self.__schema
 
-    if "retries_exhausted" in combined or (
-        "retries" in combined and "exhaust" in combined
-    ):
-        return ERROR_CODE_RETRIES_EXHAUSTED
+    def describe(self) -> JSONObject:
+        return {
+            "provider": self.__provider.name,
+            "ready": self.__provider.is_ready(),
+            "models": list(self.__provider.models),
+            "validated_fields": list(self.required_fields),
+        }
 
-    return ERROR_CODE_UNAVAILABLE
+    def analyse(self, record: JSONObject) -> AIResult:
+        """Prompt → provider → validated fields merged into the record.
 
+        Every successful record is marked source="gemini". Never raises
+        for API or schema failures.
+        """
+        if not isinstance(record, dict):
+            return AIResult(failure=AIFailure(
+                AIFailure.INVALID_RESPONSE,
+                "The check-in must be a dict from io_manager."))
+        result = self.call_api(self.build_prompt(record), answers=record)
+        if result.fields is None:
+            return result
+        return AIResult(fields={**record, **result.fields})
 
-def _structured_ai_error(error_code: str, detail: str) -> dict[str, str]:
-    """Build the failure dict Flask can pass to io_manager.format_ai_error."""
-    code = error_code if error_code in AI_ERROR_CODES else ERROR_CODE_UNAVAILABLE
-    return {
-        "error_code": code,
-        "detail": str(detail),
-        "source": AI_SOURCE,
-    }
+    def build_prompt(self, record: JSONObject) -> str:
+        """Ask Gemini to calculate stress_score from the raw answers.
 
+        The JSON at the end holds only prompt_fields. Question wording and
+        answer labels are instructions, not scored fields.
+        """
+        payload = {key: record.get(key) for key in self.prompt_fields}
+        count = len(self.answer_keys)
+        labels = ", ".join(f'"{label}"' for label in SoftLabelValidator.LABELS)
+        rules = self.__auditor.instructions() if self.__auditor else ""
+        lines = [
+            "You are a supportive student-wellbeing assistant for "
+            "DoNotStress, a local check-in used by students.",
+            f"Calculate stress_score from the {count} answers with the "
+            "formula below. You are not given a score, a tier, or a "
+            "written reflection. Do not diagnose, and do not invent "
+            "contacts.",
+            rules + "Question wording and answer labels:",
+            *(self.__format_question(item) for item in self.__questions),
+            "Speak to the student with warmth. Return ONLY a single JSON "
+            "object (no markdown fences, no commentary) with exactly these "
+            "keys:",
+            f'- "scored_items": object of the {count} converted values. '
+            f"Keys are {', '.join(self.answer_keys)}. Each value is an "
+            "integer from 1 to 5.",
+            f'- "stress_score": the mean above, from '
+            f"{ScoreValidator.MINIMUM:g} to {ScoreValidator.MAXIMUM:g}, "
+            "rounded to 2 decimal places",
+            '- "risk_category": "Low", "Moderate", or "High", matching '
+            "stress_score",
+            '- "primary_stressors": list of snake_case strings chosen ONLY '
+            f"from: {', '.join(sorted(StressorsValidator.ALLOWED))}",
+            '- "confidence": number from 0.0 to 1.0',
+            '- "reasoning": 2 or 3 warm, plain sentences written to the '
+            "student. No numbers, no jargon, no diagnosis, and no contacts",
+            f'- "soft_label": exactly one of {labels}, matching '
+            "risk_category. Use a straight apostrophe in You're doing ok",
+            '- "tips": list of 1 to 3 tip IDs only, each one of: '
+            f"{', '.join(sorted(TipsValidator.ALLOWED))}. Do not invent "
+            "tip text",
+            '- "speak_prominence": "low", "medium", or "high", matching '
+            "risk_category. This is how strongly the UI highlights Talk to "
+            "someone. SIT Counselling stays available and is shown more "
+            "prominently when stress is higher",
+            "Do not add other keys. Never invent phone numbers, emails, or "
+            "offices. SIT Counselling contacts are shown by the UI, not by "
+            "you.",
+            "",
+            "Student check-in:",
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        ]
+        return "\n".join(lines) + "\n"
 
-def _final_ai_error(
-    last_kind: str,
-    last_detail: str,
-    *,
-    attempts: int,
-    last_was_api_exception: bool,
-) -> dict[str, str]:
-    """
-    Choose the structured code after the retry loop ends.
+    def call_api(self, prompt: str,
+                 answers: JSONObject | None = None) -> AIResult:
+        """Try the provider's models in order until a reply is valid.
 
-    - timeout / DeadlineExceeded stay timeout (even after retries)
-    - schema / malformed JSON stay invalid_response
-    - other API exceptions after more than one attempt → retries_exhausted
-    - other one-shot API / network failures → unavailable
-    """
-    if last_kind == ERROR_CODE_TIMEOUT:
-        code = ERROR_CODE_TIMEOUT
-    elif last_kind == ERROR_CODE_INVALID_RESPONSE:
-        code = ERROR_CODE_INVALID_RESPONSE
-    elif last_was_api_exception and attempts > 1:
-        code = ERROR_CODE_RETRIES_EXHAUSTED
-    elif last_kind in AI_ERROR_CODES:
-        code = last_kind
-    else:
-        code = ERROR_CODE_UNAVAILABLE
-    return _structured_ai_error(code, last_detail)
+        A missing key stops at once. A timeout or invalid reply gets one
+        more try on the same model; any other error moves to the next
+        model. At most MAX_TOTAL_CALLS calls are made, so a 429 never turns
+        into a retry storm. When answers are given, the auditor checks each
+        schema-valid reply. Never raises and never logs the API key.
+        """
+        if not self.__provider.is_ready():
+            detail = "GEMINI_API_KEY is not set; cannot call Gemini."
+            self.logger.error(detail)
+            return AIResult(failure=AIFailure(
+                AIFailure.MISSING_API_KEY, detail))
+        failures: list[AIFailure] = []
+        calls = 0
+        last_try = 1
+        for model in self.__provider.models:
+            if calls == self.MAX_TOTAL_CALLS:
+                break
+            for attempt in range(1, self.__tries_per_model + 1):
+                if calls == self.MAX_TOTAL_CALLS:
+                    break
+                if attempt > 1:
+                    self.__pause(attempt - 1)
+                calls += 1
+                last_try = attempt
+                result = self.__attempt(prompt, model, answers, attempt)
+                if result.failure is None:
+                    return result
+                if result.failure.code == AIFailure.MISSING_API_KEY:
+                    return result
+                failures.append(result.failure)
+                if result.failure.code not in self.REPEATABLE:
+                    break
+            self.logger.warning("Gemini model %s failed (%s)", model,
+                                failures[-1].code)
+        return AIResult(failure=self.__final_failure(failures, last_try))
 
+    def parse_response(self, raw: object) -> JSONObject | None:
+        """The JSON object inside a raw reply, even inside code fences.
 
-def _mark_gemini_success(ai_fields: dict[str, Any]) -> dict[str, Any]:
-    """Attach the success marker Data/Flask can trust. Never used on failure."""
-    marked = dict(ai_fields)
-    marked["source"] = AI_SOURCE
-    return marked
-
-
-def build_prompt(student_dict: dict[str, Any]) -> str:
-    """
-    Build a structured prompt from a validated student check-in (from io_manager).
-
-    Uses only the student-facing fields. Instructs Gemini to act as a
-    supportive student-wellbeing assistant and return ONLY the required JSON.
-    """
-    payload = {
-        "student_id": student_dict.get("student_id"),
-        "sleep_hours": student_dict.get("sleep_hours"),
-        "stress_level": student_dict.get("stress_level"),
-        "academic_workload": student_dict.get("academic_workload"),
-        "financial_stress": student_dict.get("financial_stress"),
-        "social_support": student_dict.get("social_support"),
-        "feelings_text": student_dict.get("feelings_text") or "",
-    }
-    record_json = json.dumps(payload, ensure_ascii=False, indent=2)
-    stressor_list = ", ".join(sorted(ALLOWED_PRIMARY_STRESSORS))
-    tip_id_list = ", ".join(sorted(ALLOWED_TIP_IDS))
-    soft_label_list = ", ".join(f'"{label}"' for label in SOFT_LABELS)
-
-    return (
-        "You are a supportive student-wellbeing assistant for DoNotStress, "
-        "a local check-in tool used by students (not an advisor dashboard).\n"
-        "Speak to the student with warmth and care. Analyse the check-in "
-        "holistically and return ONLY a single JSON object (no markdown "
-        "fences, no commentary) with exactly these keys:\n"
-        '- "risk_score": float between 0.0 and 1.0 (composite risk likelihood)\n'
-        '- "risk_category": one of "Low", "Moderate", "High"\n'
-        '- "primary_stressors": list of short snake_case strings chosen ONLY '
-        f"from this allow-list: {stressor_list}\n"
-        '- "recommended_support": short internal string (the UI shows tips, '
-        "not this field)\n"
-        '- "confidence": float between 0.0 and 1.0 (your confidence)\n'
-        '- "reasoning": short plain-English explanation that is safe to show '
-        "a student; do not invent contacts\n"
-        f'- "soft_label": EXACTLY one of: {soft_label_list} '
-        "(ASCII apostrophe in You're doing ok)\n"
-        '- "tips": list of 1 to 3 tip IDs only (not sentences). Each ID MUST '
-        f"be one of: {tip_id_list}. Do not invent tip text or extra IDs. "
-        "The UI maps these IDs to student-facing copy.\n"
-        '- "speak_prominence": one of "low", "medium", "high" — how strongly '
-        "the UI should highlight Speak to advisor (always visible; more "
-        "prominent when risk is higher)\n"
-        "\n"
-        "Never invent phone numbers, emails, or offices. Do not include "
-        "contact details in JSON. Speak-to-advisor contacts are shown by "
-        "the UI separately.\n"
-        "\n"
-        "Student check-in:\n"
-        f"{record_json}\n"
-    )
-
-
-def _as_unit_interval(value: Any, field_name: str) -> tuple[bool, Any]:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return False, f"{field_name} must be a float between 0.0 and 1.0."
-    if number < 0.0 or number > 1.0:
-        return False, f"{field_name} must be between 0.0 and 1.0."
-    return True, number
-
-
-def _normalise_soft_label(value: Any) -> tuple[bool, Any]:
-    if not isinstance(value, str):
-        return False, "soft_label must be a string."
-    label = value.strip()
-    normalised = _SOFT_LABEL_ALIASES.get(label)
-    if normalised is None:
-        return (
-            False,
-            'soft_label must be "You\'re doing ok", "Worth a check-in", '
-            'or "Please reach out".',
-        )
-    return True, normalised
-
-
-def _normalise_stressors(value: Any) -> tuple[bool, Any]:
-    if not isinstance(value, list):
-        return False, "primary_stressors must be a list of allow-listed strings."
-    seen: set[str] = set()
-    cleaned: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            return False, "primary_stressors must be a list of strings."
-        name = item.strip()
-        if name not in ALLOWED_PRIMARY_STRESSORS:
-            return False, f"primary_stressor is not on the allow-list: {name}."
-        if name not in seen:
-            seen.add(name)
-            cleaned.append(name)
-    return True, cleaned
-
-
-def _normalise_tips(value: Any) -> tuple[bool, Any]:
-    if not isinstance(value, list):
-        return False, "tips must be a list of 1–3 allow-listed tip IDs."
-    if len(value) < _TIPS_MIN or len(value) > _TIPS_MAX:
-        return False, "tips must contain between 1 and 3 allow-listed tip IDs."
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, str):
-            return False, "each tip must be an allow-listed tip ID."
-        tip_id = item.strip()
-        if tip_id not in ALLOWED_TIP_IDS:
-            return False, f"tip ID is not on the allow-list: {tip_id}"
-        if tip_id not in seen:
-            seen.add(tip_id)
-            cleaned.append(tip_id)
-    if not cleaned:
-        return False, "tips must contain between 1 and 3 allow-listed tip IDs."
-    return True, cleaned
-
-
-def validate_ai_response(payload: Any) -> tuple[bool, Any]:
-    """
-    Validate Gemini JSON against the student schema and allow-lists.
-
-    Returns (True, normalised_dict) or (False, error_message).
-    Never raises for malformed payloads.
-    """
-    if isinstance(payload, str):
-        text = payload.strip()
-        if not text:
-            return False, "Empty AI response string."
+        Returns None for empty, non-text or malformed input. Never raises.
+        """
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, str):
+            return None
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end <= start:
+            return None
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            return False, f"AI response is not valid JSON: {exc}"
+            data = json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
 
-    if not isinstance(payload, dict):
-        return False, "AI response must be a JSON object."
+    def validate_response(self, payload: object) -> tuple[bool, JSONValue]:
+        """Run every field validator over a reply (dict or JSON text).
 
-    missing = [key for key in _REQUIRED_FIELDS if key not in payload]
-    if missing:
-        return False, f"AI response missing required fields: {', '.join(missing)}."
+        Checks required keys, types, ranges and allow-lists only; extra
+        keys are dropped. Returns (True, fields) or (False, message).
+        """
+        if isinstance(payload, str):
+            if not payload.strip():
+                return False, "Empty AI response string."
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError as error:
+                return False, f"AI response is not valid JSON: {error}"
+        if not isinstance(payload, dict):
+            return False, "AI response must be a JSON object."
+        missing = [name for name in self.required_fields
+                   if name not in payload]
+        if missing:
+            return False, ("AI response missing required fields: "
+                           f"{', '.join(missing)}.")
+        fields: JSONObject = {}
+        for validator in self.__validators:
+            ok, value = validator.validate(payload[validator.field])
+            if not ok:
+                return False, value
+            fields[validator.field] = value
+        return True, fields
 
-    score_ok, risk_score = _as_unit_interval(payload["risk_score"], "risk_score")
-    if not score_ok:
-        return False, risk_score
-
-    risk_category = payload["risk_category"]
-    if (
-        not isinstance(risk_category, str)
-        or risk_category not in ALLOWED_RISK_CATEGORIES
-    ):
-        return False, 'risk_category must be "Low", "Moderate", or "High".'
-
-    stressors_ok, stressors = _normalise_stressors(payload["primary_stressors"])
-    if not stressors_ok:
-        return False, stressors
-
-    recommended = payload["recommended_support"]
-    if not isinstance(recommended, str) or not recommended.strip():
-        return False, "recommended_support must be a non-empty string."
-
-    conf_ok, confidence = _as_unit_interval(payload["confidence"], "confidence")
-    if not conf_ok:
-        return False, confidence
-
-    reasoning = payload["reasoning"]
-    if not isinstance(reasoning, str) or not reasoning.strip():
-        return False, "reasoning must be a non-empty string."
-
-    label_ok, soft_label = _normalise_soft_label(payload["soft_label"])
-    if not label_ok:
-        return False, soft_label
-
-    tips_ok, tips = _normalise_tips(payload["tips"])
-    if not tips_ok:
-        return False, tips
-
-    speak_prominence = payload["speak_prominence"]
-    if (
-        not isinstance(speak_prominence, str)
-        or speak_prominence.strip() not in ALLOWED_SPEAK_PROMINENCE
-    ):
-        return False, 'speak_prominence must be "low", "medium", or "high".'
-
-    normalised = {
-        "risk_score": risk_score,
-        "risk_category": risk_category,
-        "primary_stressors": stressors,
-        "recommended_support": recommended.strip(),
-        "confidence": confidence,
-        "reasoning": reasoning.strip(),
-        "soft_label": soft_label,
-        "tips": tips,
-        "speak_prominence": speak_prominence.strip(),
-    }
-    return True, normalised
-
-
-def _default_generate(prompt: str, api_key: str, model_name: str) -> str:
-    """
-    Real Gemini call (structured JSON). Isolated so tests can inject a stub.
-    Reads the key from the caller; never hardcode GEMINI_API_KEY.
-    """
-    import google.generativeai as genai
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        generation_config={
-            "response_mime_type": "application/json",
-            "temperature": 0.2,
-        },
-    )
-    response = model.generate_content(prompt)
-    text = getattr(response, "text", None)
-    if text is None:
+    def __attempt(self, prompt: str, model: str, answers: JSONObject | None,
+                  attempt: int) -> AIResult:
+        """One provider call, turned into fields or a failure."""
+        label = f"(attempt {attempt}/{self.__tries_per_model}) model={model}"
         try:
-            text = response.candidates[0].content.parts[0].text
-        except (AttributeError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Gemini returned no text payload: {exc}") from exc
-    return text
+            raw = self.__provider.generate(prompt, model, self.__schema)
+        except Exception as error:  # a provider failure must not crash
+            detail = (f"Gemini API failure {label}: "
+                      f"{self.__provider.redact(str(error))}")
+            self.logger.warning(detail)
+            return AIResult(failure=AIFailure(
+                self.__classifier.classify(error), detail))
+        ok, checked = self.__check_reply(raw, answers)
+        if ok and isinstance(checked, dict):
+            return AIResult(fields={**checked, "source": self.SOURCE})
+        detail = f"Schema validation failed {label}: {checked}"
+        self.logger.warning(detail)
+        return AIResult(failure=AIFailure(AIFailure.INVALID_RESPONSE, detail))
 
-
-def call_gemini(
-    prompt: str,
-    *,
-    api_key: str | None = None,
-    model_name: str = _DEFAULT_MODEL,
-    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
-    retry_delay_sec: float = _DEFAULT_RETRY_DELAY_SEC,
-    generate_fn: Callable[[str, str, str], str] | None = None,
-) -> tuple[bool, dict[str, Any] | None, dict[str, str] | None]:
-    """
-    Call Gemini with structured JSON output, validate schema, retry on failure.
-
-    Returns (ok, validated_ai_dict_or_None, error_or_None).
-    On failure, error is {"error_code", "detail", "source": "gemini"}.
-    Never crashes the program on API / timeout / malformed JSON.
-    Never invents soft_label / tips / speak_prominence on failure.
-    """
-    key = (api_key if api_key is not None else os.environ.get("GEMINI_API_KEY", "")).strip()
-    generator = generate_fn if generate_fn is not None else _default_generate
-
-    # Env-only key. Do not attempt the real API when it is missing/blank.
-    # generate_fn injection is for tests and still runs without a key.
-    if generate_fn is None and not key:
-        detail = "GEMINI_API_KEY is not set; cannot call Gemini."
-        logger.error(detail)
-        return False, None, _structured_ai_error(ERROR_CODE_MISSING_API_KEY, detail)
-
-    last_detail = "Unknown AI failure."
-    last_kind = ERROR_CODE_UNAVAILABLE
-    last_was_api_exception = False
-    attempts = max(1, int(max_attempts))
-
-    for attempt in range(1, attempts + 1):
+    def __check_reply(self, raw: str,
+                      answers: JSONObject | None) -> tuple[bool, JSONValue]:
+        parsed = self.parse_response(raw)
+        ok, fields = self.validate_response(raw if parsed is None else parsed)
+        if not ok or not isinstance(fields, dict):
+            return False, fields
+        if self.__auditor is None or answers is None:
+            return True, fields
         try:
-            raw_text = generator(prompt, key, model_name)
-        except Exception as exc:  # noqa: BLE001 — must not crash pipeline
-            last_was_api_exception = True
-            last_kind = classify_ai_error(exc)
-            last_detail = f"Gemini API failure (attempt {attempt}/{attempts}): {exc}"
-            logger.warning(last_detail)
-            if attempt < attempts:
-                time.sleep(retry_delay_sec)
-            continue
+            problem = self.__auditor.verify(fields, answers)
+        except Exception as error:  # a broken check must not crash
+            return False, f"Score check could not run: {error}"
+        return (False, problem) if problem else (True, fields)
 
-        ok, result = validate_ai_response(raw_text)
-        if ok:
-            return True, _mark_gemini_success(result), None
+    def __final_failure(self, failures: list[AIFailure],
+                        last_try: int) -> AIFailure:
+        """The failure to report once every allowed call has been made.
 
-        last_was_api_exception = False
-        last_kind = ERROR_CODE_INVALID_RESPONSE
-        last_detail = f"Schema validation failed (attempt {attempt}/{attempts}): {result}"
-        logger.warning(last_detail)
-        if attempt < attempts:
-            time.sleep(retry_delay_sec)
+        A non-repeatable error on a model's second try means the retry
+        did not help, which is reported as retries_exhausted.
+        """
+        if not failures:
+            return AIFailure(AIFailure.UNAVAILABLE, "No model was tried.")
+        last = failures[-1]
+        if last_try > 1 and last.code not in self.REPEATABLE:
+            return AIFailure(AIFailure.RETRIES_EXHAUSTED, last.detail)
+        return last
 
-    return False, None, _final_ai_error(
-        last_kind,
-        last_detail,
-        attempts=attempts,
-        last_was_api_exception=last_was_api_exception,
-    )
+    def __pause(self, retry: int) -> None:
+        """Back off before a retry: the base delay, then doubled."""
+        time.sleep(self.__retry_delay_sec * 2 ** (retry - 1))
 
+    def __build_schema(self) -> JSONObject:
+        names: list[JSONValue] = list(self.required_fields)
+        return {
+            "type": "OBJECT",
+            "propertyOrdering": names,
+            "required": names,
+            "properties": {validator.field: validator.schema()
+                           for validator in self.__validators},
+        }
 
-def analyse_student(
-    student_dict: dict[str, Any],
-    *,
-    api_key: str | None = None,
-    model_name: str = _DEFAULT_MODEL,
-    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
-    retry_delay_sec: float = _DEFAULT_RETRY_DELAY_SEC,
-    generate_fn: Callable[[str, str, str], str] | None = None,
-) -> tuple[bool, dict[str, Any] | None, dict[str, str] | None]:
-    """
-    Entry point for the AI Processing Layer.
-
-    Builds prompt → calls Gemini → validates schema → merges AI fields into
-    a shallow copy of the student record. Every successful record is marked
-    source="gemini" so Data/Flask can trust Gemini processing.
-
-    Returns (ok, enriched_record_or_None, error_or_None). Never raises for
-    API / schema failures. On failure the record is None (no invented
-    soft_label / tips / speak_prominence).
-    """
-    if not isinstance(student_dict, dict):
-        return False, None, _structured_ai_error(
-            ERROR_CODE_INVALID_RESPONSE,
-            "student_dict must be a dict from io_manager.",
-        )
-
-    prompt = build_prompt(student_dict)
-    ok, ai_fields, err = call_gemini(
-        prompt,
-        api_key=api_key,
-        model_name=model_name,
-        max_attempts=max_attempts,
-        retry_delay_sec=retry_delay_sec,
-        generate_fn=generate_fn,
-    )
-    if not ok or ai_fields is None:
-        return False, None, err
-
-    enriched = dict(student_dict)
-    enriched.update(ai_fields)
-    enriched["source"] = AI_SOURCE
-    return True, enriched, None
+    def __format_question(self, question: Question) -> str:
+        """One question line: key, wording and answer labels. No scores."""
+        tone = (" Positively worded: a high answer means less stress."
+                if question.reverse else "")
+        head = f"- {question.key}: {question.prompt}{tone}"
+        if question.options:
+            labels = ", ".join(
+                f"{number} = {label}"
+                for number, label in enumerate(question.options, start=1))
+            return f"{head} Answer labels: {labels}."
+        return (f"{head} Answer: {question.minimum} to {question.maximum} "
+                f"hours in steps of {question.step:g} ({question.low} to "
+                f"{question.high}), not a 1 to 5 rating.")

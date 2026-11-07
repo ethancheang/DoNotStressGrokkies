@@ -1,5 +1,10 @@
+.env
+.env.*
+!.env.example
 .venv/
+venv/
 __pycache__/
-*.pyc
-.pytest_cache/
-data/student_records.json
+*.py[cod]
+data/
+
+.vscode/
